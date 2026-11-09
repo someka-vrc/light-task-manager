@@ -4,9 +4,12 @@ use super::{glyph, icons, Cmd, Cursor, Cx, Ev, Nav, Page};
 use crate::actions;
 use crate::columns::{self, Col, ALL};
 use crate::gfx::{rect, Align, Canvas, Font, Rect};
+use crate::grouping::{self, Group, GroupId};
 use crate::model::{Proc, Snapshot};
 use crate::settings::Settings;
 use crate::theme::THEME;
+use std::collections::HashSet;
+use std::fmt::Write;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -16,7 +19,9 @@ const VK_PRIOR: u16 = 0x21;
 const VK_NEXT: u16 = 0x22;
 const VK_END: u16 = 0x23;
 const VK_HOME: u16 = 0x24;
+const VK_LEFT: u16 = 0x25;
 const VK_UP: u16 = 0x26;
+const VK_RIGHT: u16 = 0x27;
 const VK_DOWN: u16 = 0x28;
 const VK_DELETE: u16 = 0x2E;
 const VK_C: u16 = 0x43;
@@ -25,6 +30,22 @@ const VK_F5: u16 = 0x74;
 const WHEEL_LINES: f32 = 3.0;
 const SCROLL_EASE_SECONDS: f32 = 0.04;
 const PICKER_COLUMNS: i32 = 3;
+const FLING_DECAY_SECONDS: f32 = 0.5;
+const FLING_STOP_SPEED: f32 = 40.0;
+const TOUCH_EDGE_FACTOR: i32 = 3;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Row {
+    Proc(u32),
+    Group(u32),
+    Child(u32),
+}
+
+#[derive(Clone, PartialEq)]
+enum Sel {
+    Proc((u32, i64)),
+    Group(GroupId),
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Act {
@@ -52,7 +73,7 @@ enum Overlay {
         hover: Option<usize>,
     },
     Confirm {
-        key: (u32, i64),
+        targets: Vec<(u32, i64)>,
         name: String,
         tree: bool,
         hover: Option<usize>,
@@ -97,19 +118,31 @@ struct Layout {
     content_w: i32,
     end_btn: Rect,
     col_btn: Rect,
+    group_btn: Rect,
+    chevron: i32,
+    indent: i32,
 }
 
 pub struct DetailsPage {
     snap: Arc<Snapshot>,
     sorted: Vec<u32>,
-    view: Vec<u32>,
+    groups: Vec<Group>,
+    in_group: Vec<bool>,
+    expanded: HashSet<GroupId>,
+    grouping: bool,
+    top: Vec<Row>,
+    view: Vec<Row>,
     filter: Vec<String>,
     haystacks: Vec<String>,
-    selected: Option<(u32, i64)>,
+    selected: Option<Sel>,
     scroll_y: f32,
     target_y: f32,
     scroll_x: i32,
+    pan_remainder: f32,
+    fling: (f32, f32),
     hover_row: Option<usize>,
+    hover_chevron: bool,
+    hover_group: bool,
     hover_header: Option<usize>,
     hover_edge: bool,
     hover_vbar: bool,
@@ -128,6 +161,11 @@ impl DetailsPage {
         Self {
             snap: Arc::new(Snapshot::default()),
             sorted: Vec::new(),
+            groups: Vec::new(),
+            in_group: Vec::new(),
+            expanded: HashSet::new(),
+            grouping: false,
+            top: Vec::new(),
             view: Vec::new(),
             filter: Vec::new(),
             haystacks: Vec::new(),
@@ -135,7 +173,11 @@ impl DetailsPage {
             scroll_y: 0.0,
             target_y: 0.0,
             scroll_x: 0,
+            pan_remainder: 0.0,
+            fling: (0.0, 0.0),
             hover_row: None,
+            hover_chevron: false,
+            hover_group: false,
             hover_header: None,
             hover_edge: false,
             hover_vbar: false,
@@ -150,36 +192,161 @@ impl DetailsPage {
         }
     }
 
+    /// Rebuilds the groups from the current snapshot.
+    fn regroup(&mut self, settings: &Settings) {
+        self.grouping = settings.group && settings.columns.iter().any(|(c, _)| *c == Col::Name);
+        (self.groups, self.in_group) = if self.grouping {
+            grouping::build(&self.snap.procs)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        // A selected process must stay visible when it joins a collapsed group.
+        if let Some(Sel::Proc(key)) = self.selected {
+            let procs = &self.snap.procs;
+            let home = self.groups.iter().find(|g| g.members.iter().any(|m| procs[*m as usize].key() == key));
+            if let Some(g) = home {
+                self.expanded.insert(g.id.clone());
+            }
+        }
+        if self.grouping {
+            let groups = &self.groups;
+            self.expanded.retain(|id| groups.iter().any(|g| g.id == *id));
+        }
+        self.resort(settings);
+        if self.selected.is_some() && self.selected_proc().is_none() {
+            self.selected = None;
+        }
+    }
+
     fn resort(&mut self, settings: &Settings) {
         let procs = &self.snap.procs;
         let (col, desc) = (settings.sort, settings.descending);
+        let compare = |a: &Proc, b: &Proc| {
+            let order = columns::compare(col, a, b);
+            let order = if desc { order.reverse() } else { order };
+            order.then(a.pid.cmp(&b.pid))
+        };
         self.sorted.clear();
         self.sorted.extend(0..procs.len() as u32);
-        self.sorted.sort_unstable_by(|a, b| {
-            let (pa, pb) = (&procs[*a as usize], &procs[*b as usize]);
-            let order = columns::compare(col, pa, pb);
-            let order = if desc { order.reverse() } else { order };
-            order.then(pa.pid.cmp(&pb.pid))
-        });
+        self.sorted.sort_unstable_by(|a, b| compare(&procs[*a as usize], &procs[*b as usize]));
+        for g in &mut self.groups {
+            g.members.sort_unstable_by(|a, b| compare(&procs[*a as usize], &procs[*b as usize]));
+        }
+
+        let groups = &self.groups;
+        let mut order: Vec<u32> = (0..groups.len() as u32).collect();
+        order.sort_unstable_by(|a, b| compare(&groups[*a as usize].summary, &groups[*b as usize].summary));
+        let in_group = &self.in_group;
+        let mut singles = self
+            .sorted
+            .iter()
+            .copied()
+            .filter(|i| !in_group.get(*i as usize).copied().unwrap_or(false))
+            .peekable();
+        let mut order = order.into_iter().peekable();
+        self.top.clear();
+        loop {
+            let group_first = match (singles.peek(), order.peek()) {
+                (Some(s), Some(g)) => compare(&groups[*g as usize].summary, &procs[*s as usize]).is_lt(),
+                (None, Some(_)) => true,
+                (Some(_), None) => false,
+                (None, None) => break,
+            };
+            let row = if group_first {
+                order.next().map(Row::Group)
+            } else {
+                singles.next().map(Row::Proc)
+            };
+            self.top.extend(row);
+        }
         self.refilter();
     }
 
     fn refilter(&mut self) {
         self.view.clear();
-        if self.filter.is_empty() {
-            self.view.extend_from_slice(&self.sorted);
-        } else {
-            if self.haystacks.len() != self.snap.procs.len() {
-                self.haystacks = self.snap.procs.iter().map(haystack).collect();
+        let filtering = !self.filter.is_empty();
+        if filtering && self.haystacks.len() != self.snap.procs.len() {
+            self.haystacks = self.snap.procs.iter().map(haystack).collect();
+        }
+        let (hay, terms) = (&self.haystacks, &self.filter);
+        let hit = |i: u32| !filtering || terms.iter().all(|t| hay[i as usize].contains(t.as_str()));
+        for row in &self.top {
+            match *row {
+                Row::Group(g) => {
+                    let group = &self.groups[g as usize];
+                    let open = filtering || self.expanded.contains(&group.id);
+                    if filtering && !group.members.iter().any(|m| hit(*m)) {
+                        continue;
+                    }
+                    self.view.push(*row);
+                    if open {
+                        self.view.extend(group.members.iter().copied().filter(|m| hit(*m)).map(Row::Child));
+                    }
+                }
+                Row::Proc(i) if hit(i) => self.view.push(*row),
+                _ => {}
             }
-            let (hay, terms) = (&self.haystacks, &self.filter);
-            self.view.extend(
-                self.sorted
-                    .iter()
-                    .filter(|i| terms.iter().all(|t| hay[**i as usize].contains(t.as_str()))),
-            );
         }
         self.clamp_scroll();
+    }
+
+    fn row_proc(&self, row: Row) -> &Proc {
+        match row {
+            Row::Proc(i) | Row::Child(i) => &self.snap.procs[i as usize],
+            Row::Group(g) => &self.groups[g as usize].summary,
+        }
+    }
+
+    fn row_sel(&self, row: Row) -> Sel {
+        match row {
+            Row::Proc(i) | Row::Child(i) => Sel::Proc(self.snap.procs[i as usize].key()),
+            Row::Group(g) => Sel::Group(self.groups[g as usize].id.clone()),
+        }
+    }
+
+    fn row_selected(&self, row: Row) -> bool {
+        match (row, self.selected.as_ref()) {
+            (Row::Proc(i) | Row::Child(i), Some(Sel::Proc(key))) => self.snap.procs[i as usize].key() == *key,
+            (Row::Group(g), Some(Sel::Group(id))) => self.groups[g as usize].id == *id,
+            _ => false,
+        }
+    }
+
+    fn toggle_group(&mut self, g: u32) {
+        // Filtering shows every matching member regardless of this state.
+        if !self.filter.is_empty() {
+            return;
+        }
+        let group = &self.groups[g as usize];
+        let id = group.id.clone();
+        if self.expanded.remove(&id) {
+            if let Some(Sel::Proc(key)) = self.selected {
+                let procs = &self.snap.procs;
+                if group.members.iter().any(|m| procs[*m as usize].key() == key) {
+                    self.selected = Some(Sel::Group(id));
+                }
+            }
+        } else {
+            self.expanded.insert(id);
+        }
+        self.refilter();
+    }
+
+    fn pan_x(&mut self, dx: f32) -> bool {
+        self.pan_remainder += dx;
+        let whole = self.pan_remainder.trunc();
+        self.pan_remainder -= whole;
+        let before = self.scroll_x;
+        self.scroll_x -= whole as i32;
+        self.clamp_scroll();
+        whole == 0.0 || self.scroll_x != before
+    }
+
+    fn pan_y(&mut self, dy: f32) -> bool {
+        let wanted = self.scroll_y - dy;
+        self.scroll_y = wanted.clamp(0.0, self.max_scroll_y());
+        self.target_y = self.scroll_y;
+        self.scroll_y == wanted
     }
 
     fn max_scroll_y(&self) -> f32 {
@@ -206,20 +373,26 @@ impl DetailsPage {
     }
 
     fn selected_index(&self) -> Option<usize> {
-        let key = self.selected?;
-        self.view
-            .iter()
-            .position(|i| self.snap.procs[*i as usize].key() == key)
+        self.selected.as_ref()?;
+        self.view.iter().position(|row| self.row_selected(*row))
     }
 
+    fn selected_group(&self) -> Option<&Group> {
+        let Some(Sel::Group(id)) = &self.selected else { return None };
+        self.groups.iter().find(|g| g.id == *id)
+    }
+
+    /// The selected process, or the totals row of the selected group.
     fn selected_proc(&self) -> Option<&Proc> {
-        let key = self.selected?;
-        self.snap.procs.iter().find(|p| p.key() == key)
+        match self.selected.as_ref()? {
+            Sel::Proc(key) => self.snap.procs.iter().find(|p| p.key() == *key),
+            Sel::Group(_) => self.selected_group().map(|g| &g.summary),
+        }
     }
 
     fn select_index(&mut self, index: usize) {
-        if let Some(i) = self.view.get(index) {
-            self.selected = Some(self.snap.procs[*i as usize].key());
+        if let Some(row) = self.view.get(index).copied() {
+            self.selected = Some(self.row_sel(row));
             let (top, rh) = (index as i32 * self.l.row_h, self.l.row_h);
             let visible = self.l.body.h - self.hbar_h();
             let mut y = self.target_y;
@@ -246,12 +419,22 @@ impl DetailsPage {
         } else {
             None
         };
+        let chevron = row.is_some_and(|i| {
+            let content_x = x - l.table.x + self.scroll_x;
+            matches!(self.view[i], Row::Group(_))
+                && l.cols.iter().find(|c| c.col == Col::Name).is_some_and(|c| {
+                    let w = if cx.touch { c.w } else { l.pad + l.chevron };
+                    content_x >= c.x && content_x < c.x + w
+                })
+        });
+        self.hover_chevron = chevron;
+        let edge_reach = if cx.touch { l.edge * TOUCH_EDGE_FACTOR } else { l.edge };
         let (mut header, mut edge) = (None, false);
         let in_header = y >= l.table.y && y < l.body.y && x >= l.table.x && x < l.table.r();
         if in_header {
             let cx_x = x - l.table.x + self.scroll_x;
             for (i, c) in l.cols.iter().enumerate() {
-                if (cx_x - (c.x + c.w)).abs() <= l.edge {
+                if (cx_x - (c.x + c.w)).abs() <= edge_reach {
                     header = Some(i);
                     edge = true;
                     break;
@@ -263,6 +446,7 @@ impl DetailsPage {
         }
         let end = l.end_btn.contains(x, y);
         let col = l.col_btn.contains(x, y);
+        let group = l.group_btn.contains(x, y);
         if row != self.hover_row
             || header != self.hover_header
             || edge != self.hover_edge
@@ -270,6 +454,7 @@ impl DetailsPage {
             || hbar != self.hover_hbar
             || end != self.hover_end
             || col != self.hover_col
+            || group != self.hover_group
         {
             self.hover_row = row;
             self.hover_header = header;
@@ -278,6 +463,7 @@ impl DetailsPage {
             self.hover_hbar = hbar;
             self.hover_end = end;
             self.hover_col = col;
+            self.hover_group = group;
             *cx.dirty = true;
         }
     }
@@ -313,6 +499,7 @@ impl DetailsPage {
         if want {
             cx.shared.poke();
         }
+        self.regroup(cx.settings);
         *cx.dirty = true;
     }
 
@@ -356,10 +543,19 @@ impl DetailsPage {
     }
 
     fn confirm_end(&mut self, tree: bool) {
-        if let Some(p) = self.selected_proc() {
+        let chosen = if let Some(g) = self.selected_group() {
+            let procs = &self.snap.procs;
+            let mut keys: Vec<(u32, i64)> = g.members.iter().map(|m| procs[*m as usize].key()).collect();
+            // Oldest first, so that ending in reverse reaches children before parents.
+            keys.sort_by_key(|k| k.1);
+            Some((format!("{} ({} 個のプロセス)", g.summary.stat.name, keys.len()), keys))
+        } else {
+            self.selected_proc().map(|p| (p.stat.name.clone(), vec![p.key()]))
+        };
+        if let Some((name, targets)) = chosen {
             self.overlay = Overlay::Confirm {
-                key: p.key(),
-                name: p.stat.name.clone(),
+                targets,
+                name,
                 tree,
                 hover: None,
                 buttons: [Rect::default(); 2],
@@ -382,13 +578,14 @@ impl DetailsPage {
                 }
             }
             Act::CopyRow => {
+                let members = self.selected_group().map(|g| g.members.len());
                 if let Some(p) = self.selected_proc() {
                     let mut line = String::new();
                     for (i, (col, _)) in cx.settings.columns.iter().enumerate() {
                         if i > 0 {
                             line.push('\t');
                         }
-                        columns::cell(*col, p, &mut line);
+                        fill_cell(*col, p, members, &mut line);
                     }
                     actions::set_clipboard(&line);
                 }
@@ -402,8 +599,7 @@ impl DetailsPage {
         *cx.dirty = true;
     }
 
-    fn end_processes(&mut self, key: (u32, i64), tree: bool, cx: &mut Cx) {
-        let mut targets = vec![key];
+    fn end_processes(&mut self, mut targets: Vec<(u32, i64)>, tree: bool, cx: &mut Cx) {
         if tree {
             let mut i = 0;
             while i < targets.len() {
@@ -469,7 +665,7 @@ impl DetailsPage {
                 }
                 _ => {}
             },
-            Overlay::Confirm { key, tree, hover, buttons, .. } => match *ev {
+            Overlay::Confirm { targets, tree, hover, buttons, .. } => match *ev {
                 Ev::Move { x, y } => {
                     let new = buttons.iter().position(|b| b.contains(x, y));
                     if new != *hover {
@@ -479,14 +675,14 @@ impl DetailsPage {
                 }
                 Ev::Down { x, y, right: false } => match buttons.iter().position(|b| b.contains(x, y)) {
                     Some(0) => {
-                        confirm = Some((*key, *tree));
+                        confirm = Some((std::mem::take(targets), *tree));
                         close = true;
                     }
                     Some(_) => close = true,
                     None => {}
                 },
                 Ev::Key { vk: VK_RETURN, .. } => {
-                    confirm = Some((*key, *tree));
+                    confirm = Some((std::mem::take(targets), *tree));
                     close = true;
                 }
                 _ => {}
@@ -522,8 +718,8 @@ impl DetailsPage {
         if let Some(act) = action {
             self.run(act, cx);
         }
-        if let Some((key, tree)) = confirm {
-            self.end_processes(key, tree, cx);
+        if let Some((targets, tree)) = confirm {
+            self.end_processes(targets, tree, cx);
         }
         if let Some(i) = toggle {
             let col = ALL[i].id;
@@ -582,6 +778,7 @@ impl DetailsPage {
     }
 
     fn on_mouse_down(&mut self, x: i32, y: i32, right: bool, cx: &mut Cx) {
+        self.fling = (0.0, 0.0);
         self.mouse = (x, y);
         self.update_hover(cx);
         if !right {
@@ -592,6 +789,12 @@ impl DetailsPage {
             }
             if self.l.col_btn.contains(x, y) {
                 self.open_columns();
+                *cx.dirty = true;
+                return;
+            }
+            if self.l.group_btn.contains(x, y) {
+                cx.settings.group = !cx.settings.group;
+                self.regroup(cx.settings);
                 *cx.dirty = true;
                 return;
             }
@@ -628,13 +831,17 @@ impl DetailsPage {
             return;
         }
         if let Some(i) = self.hover_row {
-            let key = self.snap.procs[self.view[i] as usize].key();
-            if self.selected != Some(key) {
-                self.selected = Some(key);
+            let row = self.view[i];
+            let sel = self.row_sel(row);
+            if self.selected.as_ref() != Some(&sel) {
+                self.selected = Some(sel);
                 *cx.dirty = true;
             }
             if right {
                 self.open_row_menu(x, y);
+                *cx.dirty = true;
+            } else if let (true, Row::Group(g)) = (self.hover_chevron, row) {
+                self.toggle_group(g);
                 *cx.dirty = true;
             }
         } else if self.l.body.contains(x, y) && !right && self.selected.take().is_some() {
@@ -706,6 +913,25 @@ impl DetailsPage {
                 self.confirm_end(false);
                 *cx.dirty = true;
             }
+            VK_LEFT | VK_RIGHT => {
+                let Some(i) = self.selected_index() else { return };
+                match self.view[i] {
+                    Row::Group(g) => {
+                        let open = self.expanded.contains(&self.groups[g as usize].id);
+                        if open == (vk == VK_LEFT) {
+                            self.toggle_group(g);
+                            *cx.dirty = true;
+                        }
+                    }
+                    Row::Child(_) if vk == VK_LEFT => {
+                        if let Some(parent) = self.view[..i].iter().rposition(|r| matches!(r, Row::Group(_))) {
+                            self.select_index(parent);
+                            *cx.dirty = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
             VK_C if ctrl => self.run(Act::CopyRow, cx),
             VK_F5 => cx.shared.poke(),
             _ => {}
@@ -741,6 +967,9 @@ impl DetailsPage {
             cols,
             end_btn: rect(right - end_w, btn_y, end_w, btn_h),
             col_btn: rect(right - end_w - c.px(8) - btn_h, btn_y, btn_h, btn_h),
+            group_btn: rect(right - end_w - c.px(14) - btn_h * 2, btn_y, btn_h, btn_h),
+            chevron: c.px(18),
+            indent: c.px(20),
         };
         if let Some(last) = self.l.cols.last_mut() {
             if x < table.w {
@@ -751,17 +980,17 @@ impl DetailsPage {
         self.clamp_scroll();
     }
 
-    fn paint_toolbar(&mut self, c: &mut Canvas) {
+    fn paint_toolbar(&mut self, c: &mut Canvas, settings: &Settings) {
         let t = THEME;
         let l = &self.l;
         let area = l.area;
         let toolbar = rect(area.x + c.px(20), area.y, c.px(80), c.px(60));
         c.text("詳細", Font::Title, toolbar, t.text, Align::Left);
 
-        let shown = self.view.len();
+        let shown = self.view.iter().filter(|r| !matches!(r, Row::Group(_))).count();
         let total = self.snap.procs.len();
         let gib = |b: u64| b as f64 / 1024.0 / 1024.0 / 1024.0;
-        let info = if shown == total {
+        let info = if self.filter.is_empty() {
             format!(
                 "{total} プロセス   CPU {:.0}%   メモリ {:.1} / {:.1} GB",
                 self.snap.cpu_total,
@@ -772,10 +1001,18 @@ impl DetailsPage {
             format!("{shown} / {total} プロセス")
         };
         let info_x = area.x + c.px(84);
-        let info_w = l.col_btn.x - info_x - c.px(12);
+        let info_w = l.group_btn.x - info_x - c.px(12);
         c.text(&info, Font::Small, rect(info_x, area.y + c.px(3), info_w, c.px(60)), t.text_dim, Align::Left);
 
         let r = c.px(6) as f32;
+        let group_btn = l.group_btn;
+        if settings.group {
+            c.round(group_btn, r, t.selection, 255);
+        } else {
+            c.round(group_btn, r, if self.hover_group { t.hover } else { t.content }, 255);
+        }
+        c.text(&glyph(icons::GROUP), Font::Icon, group_btn, if settings.group { t.accent } else { t.text }, Align::Center);
+
         let col_btn = l.col_btn;
         c.round(col_btn, r, if self.hover_col { t.hover } else { t.content }, 255);
         c.text(&glyph(icons::COLUMNS), Font::Icon, col_btn, t.text, Align::Center);
@@ -835,13 +1072,18 @@ impl DetailsPage {
         let last = (((scroll + body.h) / rh.max(1)) as usize + 1).min(self.view.len());
         let icon_size = c.px(16);
         let radius = c.px(5) as f32;
-        let selected = self.selected;
+        let (chevron, indent) = (self.l.chevron, self.l.indent);
         let mut buf = std::mem::take(&mut self.cell);
         for i in first..last {
-            let p = &self.snap.procs[self.view[i] as usize];
+            let kind = self.view[i];
+            let p = self.row_proc(kind);
+            let members = match kind {
+                Row::Group(g) => Some(self.groups[g as usize].members.len()),
+                _ => None,
+            };
             let y = body.y + i as i32 * rh - scroll;
             let row = rect(table.x, y, table.w, rh);
-            let is_selected = selected == Some(p.key());
+            let is_selected = self.row_selected(kind);
             if is_selected {
                 c.round(row.inset(c.px(2), c.px(1)), radius, t.selection, 255);
                 c.round(rect(row.x + c.px(2), y + c.px(7), c.px(3), rh - c.px(14)), 1.5, t.accent, 255);
@@ -857,6 +1099,16 @@ impl DetailsPage {
                 let d = columns::def(b.col);
                 let mut color = t.text;
                 if b.col == Col::Name {
+                    if self.grouping {
+                        if let Row::Group(g) = kind {
+                            let open = !self.filter.is_empty() || self.expanded.contains(&self.groups[g as usize].id);
+                            let ch = if open { icons::CHEVRON_DOWN } else { icons::CHEVRON_RIGHT };
+                            c.text(&glyph(ch), Font::IconSmall, rect(cell.x, y, chevron, rh), t.text_dim, Align::Left);
+                        }
+                        let shift = chevron + if matches!(kind, Row::Child(_)) { indent } else { 0 };
+                        cell.x += shift;
+                        cell.w -= shift;
+                    }
                     let top = y + (rh - icon_size) / 2;
                     match p.stat.image.as_ref().and_then(|m| m.icon()) {
                         Some(icon) => c.icon(icon, cell.x, top, icon_size),
@@ -874,7 +1126,7 @@ impl DetailsPage {
                     }
                 }
                 buf.clear();
-                columns::cell(b.col, p, &mut buf);
+                fill_cell(b.col, p, members, &mut buf);
                 let align = if d.right { Align::Right } else { Align::Left };
                 c.text(&buf, Font::Body, cell, color, align);
             }
@@ -949,19 +1201,21 @@ impl DetailsPage {
                     c.text(item.label, Font::Body, row.inset(c.px(14), 0), color, Align::Left);
                 }
             }
-            Overlay::Confirm { name, tree, hover, buttons, .. } => {
+            Overlay::Confirm { targets, name, tree, hover, buttons } => {
                 c.fill_alpha(area, 0, 110);
                 let (w, h) = (c.px(440), c.px(192));
                 let r = rect(area.x + (area.w - w) / 2, area.y + (area.h - h) / 2, w, h);
                 Self::panel(c, r);
                 let inner = r.inset(c.px(22), 0);
+                let group = targets.len() > 1;
                 let title = if *tree { "プロセス ツリーを終了しますか?" } else { "タスクを終了しますか?" };
                 c.text(title, Font::Semi, rect(inner.x, r.y + c.px(18), inner.w, c.px(26)), t.text, Align::Left);
                 c.text(name, Font::Body, rect(inner.x, r.y + c.px(52), inner.w, c.px(24)), t.accent, Align::Left);
-                let note = if *tree {
-                    "このプロセスと子プロセスをすべて終了します。"
-                } else {
-                    "このプロセスを終了します。"
+                let note = match (group, *tree) {
+                    (true, true) => "このグループのプロセスと子プロセスをすべて終了します。",
+                    (true, false) => "このグループのプロセスをすべて終了します。",
+                    (false, true) => "このプロセスと子プロセスをすべて終了します。",
+                    (false, false) => "このプロセスを終了します。",
                 };
                 c.text(note, Font::Small, rect(inner.x, r.y + c.px(80), inner.w, c.px(22)), t.text_dim, Align::Left);
                 c.text("保存されていないデータは失われます。", Font::Small, rect(inner.x, r.y + c.px(100), inner.w, c.px(22)), t.text_dim, Align::Left);
@@ -1030,6 +1284,17 @@ impl DetailsPage {
     }
 }
 
+/// Appends a cell of a row. `members` is the size of the group the row totals.
+fn fill_cell(col: Col, p: &Proc, members: Option<usize>, out: &mut String) {
+    if members.is_some() && col == Col::Pid {
+        return;
+    }
+    columns::cell(col, p, out);
+    if let (Some(n), Col::Name) = (members, col) {
+        let _ = write!(out, " ({n})");
+    }
+}
+
 fn haystack(p: &Proc) -> String {
     format!(
         "{}\u{1}{}\u{1}{}\u{1}{}",
@@ -1063,10 +1328,7 @@ impl Page for DetailsPage {
     fn on_snapshot(&mut self, snap: &Arc<Snapshot>, cx: &mut Cx) {
         self.snap = snap.clone();
         self.haystacks.clear();
-        self.resort(cx.settings);
-        if self.selected.is_some() && self.selected_proc().is_none() {
-            self.selected = None;
-        }
+        self.regroup(cx.settings);
         self.hover_row = None;
         self.update_hover(cx);
         *cx.dirty = true;
@@ -1074,14 +1336,20 @@ impl Page for DetailsPage {
 
     fn on_enriched(&mut self, cx: &mut Cx) {
         self.haystacks.clear();
-        if !self.filter.is_empty() {
-            self.refilter();
-        }
+        // Group labels come from file descriptions, which arrive late.
+        self.regroup(cx.settings);
         *cx.dirty = true;
     }
 
     fn animating(&self) -> bool {
-        self.scroll_y != self.target_y
+        self.scroll_y != self.target_y || self.fling != (0.0, 0.0)
+    }
+
+    fn pannable(&self, x: i32, y: i32) -> bool {
+        matches!(self.overlay, Overlay::None)
+            && self.l.body.contains(x, y)
+            && !self.vthumb().is_some_and(|t| t.contains(x, y))
+            && !self.hthumb().is_some_and(|t| t.contains(x, y))
     }
 
     fn cursor(&self) -> Cursor {
@@ -1107,7 +1375,18 @@ impl Page for DetailsPage {
             }
             Ev::Down { x, y, right } => self.on_mouse_down(x, y, right, cx),
             Ev::Up { x } => self.on_mouse_up(x, cx),
+            Ev::Pan { dx, dy } => {
+                self.fling = (0.0, 0.0);
+                self.pan_x(dx);
+                self.pan_y(dy);
+                *cx.dirty = true;
+            }
+            Ev::Fling { vx, vy } => {
+                self.fling = (vx, vy);
+                *cx.dirty = true;
+            }
             Ev::Wheel { dx, dy } => {
+                self.fling = (0.0, 0.0);
                 if dx != 0.0 {
                     self.scroll_x -= (dx * WHEEL_LINES * self.l.row_h as f32) as i32;
                     self.clamp_scroll();
@@ -1121,7 +1400,15 @@ impl Page for DetailsPage {
             }
             Ev::Key { vk, ctrl } => self.on_key(vk, ctrl, cx),
             Ev::Tick { dt } => {
-                if self.animating() {
+                if self.fling != (0.0, 0.0) {
+                    let (vx, vy) = self.fling;
+                    let decay = (-dt / FLING_DECAY_SECONDS).exp();
+                    let vx = if self.pan_x(vx * dt) { vx * decay } else { 0.0 };
+                    let vy = if self.pan_y(vy * dt) { vy * decay } else { 0.0 };
+                    self.fling = if vx.hypot(vy) < FLING_STOP_SPEED { (0.0, 0.0) } else { (vx, vy) };
+                    *cx.dirty = true;
+                }
+                if self.scroll_y != self.target_y {
                     self.scroll_y += (self.target_y - self.scroll_y)
                         * (1.0 - (-dt / SCROLL_EASE_SECONDS).exp());
                     if (self.target_y - self.scroll_y).abs() < 0.5 {
@@ -1136,7 +1423,7 @@ impl Page for DetailsPage {
 
     fn paint(&mut self, c: &mut Canvas, area: Rect, settings: &Settings) {
         self.layout(c, area, settings);
-        self.paint_toolbar(c);
+        self.paint_toolbar(c, settings);
         self.paint_header(c, settings);
         self.paint_rows(c);
         self.paint_overlay(c, settings);
@@ -1148,7 +1435,13 @@ impl DetailsPage {
     pub fn load_for_test(&mut self, snap: Arc<Snapshot>, settings: &Settings) {
         self.snap = snap;
         self.haystacks.clear();
-        self.resort(settings);
+        self.regroup(settings);
+    }
+
+    /// Screenshot support.
+    pub fn expand_all_for_test(&mut self) {
+        self.expanded.extend(self.groups.iter().map(|g| g.id.clone()));
+        self.refilter();
     }
 
     pub fn filter_for_test(&mut self, text: &str) {

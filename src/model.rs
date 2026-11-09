@@ -32,6 +32,8 @@ pub struct ProcStatic {
     pub elevated: Option<bool>,
     pub cmdline: String,
     pub image: Option<Arc<ImageInfo>>,
+    /// Package full name of a packaged app.
+    pub package: Option<Arc<str>>,
 }
 
 impl ProcStatic {
@@ -68,6 +70,7 @@ pub struct Proc {
     pub stat: Arc<ProcStatic>,
     pub status: Status,
     pub session: u32,
+    pub has_window: bool,
     /// Percent of total machine capacity.
     pub cpu: f32,
     /// 100ns units.

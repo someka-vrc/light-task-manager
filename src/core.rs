@@ -44,6 +44,7 @@ pub struct Core {
     pub filter_focused: bool,
     pub filter_text: String,
     pub caption_hover: Option<Caption>,
+    pub touch: bool,
     sidebar: f32,
     hover: Hover,
     page_captured: bool,
@@ -67,6 +68,7 @@ impl Core {
             filter_focused: false,
             filter_text: String::new(),
             caption_hover: None,
+            touch: false,
             sidebar,
             hover: Hover::None,
             page_captured: false,
@@ -187,8 +189,13 @@ impl Core {
             shared: &self.shared,
             cmds: &mut self.cmds,
             dirty: &mut self.dirty,
+            touch: self.touch,
         };
         f(&mut self.pages[self.active], &mut cx);
+    }
+
+    pub fn pannable(&self, x: i32, y: i32) -> bool {
+        self.pages[self.active].pannable(x, y)
     }
 
     pub fn on_snapshot(&mut self, snap: &Arc<Snapshot>) {
@@ -197,6 +204,7 @@ impl Core {
             shared: &self.shared,
             cmds: &mut self.cmds,
             dirty: &mut self.dirty,
+            touch: self.touch,
         };
         for page in &mut self.pages {
             page.on_snapshot(snap, &mut cx);
@@ -287,7 +295,9 @@ impl Core {
                     self.with_page(|p, cx| p.event(&ev, cx));
                 }
             }
-            Ev::Wheel { .. } | Ev::Key { .. } => self.with_page(|p, cx| p.event(&ev, cx)),
+            Ev::Wheel { .. } | Ev::Pan { .. } | Ev::Fling { .. } | Ev::Key { .. } => {
+                self.with_page(|p, cx| p.event(&ev, cx))
+            }
         }
         clear_filter
     }

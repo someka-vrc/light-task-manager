@@ -18,6 +18,10 @@ pub enum Ev {
     Up { x: i32 },
     /// In wheel notches, positive is away from the user.
     Wheel { dx: f32, dy: f32 },
+    /// A finger or pen dragged the content, in pixels.
+    Pan { dx: f32, dy: f32 },
+    /// The contact lifted while moving, in pixels per second. Zero stops a fling.
+    Fling { vx: f32, vy: f32 },
     Key { vk: u16, ctrl: bool },
     Tick { dt: f32 },
 }
@@ -33,6 +37,8 @@ pub struct Cx<'a> {
     pub shared: &'a Shared,
     pub cmds: &'a mut Vec<Cmd>,
     pub dirty: &'a mut bool,
+    /// The latest input came from a finger, so hit areas should be generous.
+    pub touch: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -65,6 +71,10 @@ pub trait Page {
     fn cursor(&self) -> Cursor {
         Cursor::Arrow
     }
+    /// Whether dragging a finger or pen at (x, y) should scroll the content.
+    fn pannable(&self, _x: i32, _y: i32) -> bool {
+        false
+    }
 }
 
 pub fn all() -> Vec<Box<dyn Page>> {
@@ -87,6 +97,8 @@ pub mod icons {
     pub const SETTINGS: char = '\u{E713}';
     pub const CHEVRON_UP: char = '\u{E70E}';
     pub const CHEVRON_DOWN: char = '\u{E70D}';
+    pub const CHEVRON_RIGHT: char = '\u{E76C}';
+    pub const GROUP: char = '\u{F168}';
     pub const CHECK: char = '\u{E73E}';
     pub const BLOCK: char = '\u{E8D8}';
     pub const COLUMNS: char = '\u{E9D5}';

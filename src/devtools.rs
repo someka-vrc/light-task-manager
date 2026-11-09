@@ -38,6 +38,7 @@ fn inflate(base: &Snapshot, rows: usize) -> Arc<Snapshot> {
                 elevated: p.stat.elevated,
                 cmdline: String::new(),
                 image: p.stat.image.clone(),
+                package: p.stat.package.clone(),
             });
             procs.push(copy);
         }
@@ -130,6 +131,9 @@ pub fn shot(args: &[String]) {
     let mut core = Core::new(Settings::default(), shared.clone(), 1.0, 1240, 760);
     core.active = page;
     core.on_snapshot(&live);
+    if args.get(2).is_some_and(|a| a == "expand") {
+        core.page_is_details().unwrap().expand_all_for_test();
+    }
     core.render();
     core.render();
     let _ = core.canvas.save_bmp(path);

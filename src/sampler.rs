@@ -24,6 +24,7 @@ windows_targets::link!("ntdll.dll" "system" fn NtQuerySystemInformation(class: u
 windows_targets::link!("ntdll.dll" "system" fn NtQueryInformationProcess(h: HANDLE, class: u32, buf: *mut c_void, len: u32, ret: *mut u32) -> i32);
 windows_targets::link!("kernel32.dll" "system" fn IsWow64Process2(h: HANDLE, process: *mut u16, native: *mut u16) -> BOOL);
 windows_targets::link!("user32.dll" "system" fn PrivateExtractIconsW(file: *const u16, index: i32, cx: i32, cy: i32, icons: *mut HICON, ids: *mut u32, count: u32, flags: u32) -> u32);
+windows_targets::link!("kernel32.dll" "system" fn GetPackageFullName(h: HANDLE, len: *mut u32, name: *mut u16) -> i32);
 
 const UNKNOWN: &str = "—";
 const WTS_ANY_SESSION: u32 = 0xFFFFFFFE;
@@ -251,7 +252,7 @@ impl Sampler {
         self.generation += 1;
         let capacity = elapsed_100ns * self.ncpu;
 
-        let hung = hung_processes();
+        let (hung, windowed) = window_owners();
         let want_gui = self.shared.want_gui_counts.load(Ordering::Relaxed);
         let mut wts: Option<HashMap<u32, Arc<str>>> = None;
         let mut idle_pct = 0.0f32;
@@ -339,6 +340,7 @@ impl Sampler {
                 stat,
                 status,
                 session: p.session,
+                has_window: windowed.contains(&pid),
                 cpu,
                 cpu_time,
                 cycles: p.cycles,
@@ -401,11 +403,13 @@ impl Sampler {
         let mut arch = "";
         let mut elevated = None;
         let mut cmdline = String::new();
+        let mut package = None;
         if pid > 4 {
             let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
             if !h.is_null() {
                 arch = architecture(h);
                 cmdline = command_line(h);
+                package = package_name(h);
                 let mut token = std::ptr::null_mut();
                 if unsafe { OpenProcessToken(h, TOKEN_QUERY, &mut token) } != 0 {
                     elevated = token_elevated(token);
@@ -427,6 +431,7 @@ impl Sampler {
             elevated,
             cmdline,
             image,
+            package,
         })
     }
 
@@ -642,6 +647,15 @@ fn command_line(h: HANDLE) -> String {
     nt_string(unsafe { &*(buf.as_ptr() as *const NtString) })
 }
 
+fn package_name(h: HANDLE) -> Option<Arc<str>> {
+    let mut name = [0u16; 128];
+    let mut len = name.len() as u32;
+    if unsafe { GetPackageFullName(h, &mut len, name.as_mut_ptr()) } != 0 || len == 0 {
+        return None;
+    }
+    Some(Arc::from(String::from_utf16_lossy(&name[..len as usize - 1])))
+}
+
 fn token_elevated(token: HANDLE) -> Option<bool> {
     let mut e = TOKEN_ELEVATION { TokenIsElevated: 0 };
     let mut len = 0;
@@ -672,18 +686,23 @@ fn gui_counts(pid: u32) -> (u32, u32) {
     }
 }
 
-fn hung_processes() -> HashSet<u32> {
+/// Processes with a hung window, and processes with any visible window.
+fn window_owners() -> (HashSet<u32>, HashSet<u32>) {
     unsafe extern "system" fn visit(hwnd: HWND, lp: LPARAM) -> BOOL {
-        if IsWindowVisible(hwnd) != 0 && IsHungAppWindow(hwnd) != 0 {
+        if IsWindowVisible(hwnd) != 0 {
+            let (hung, windowed) = &mut *(lp as *mut (HashSet<u32>, HashSet<u32>));
             let mut pid = 0;
             GetWindowThreadProcessId(hwnd, &mut pid);
-            (*(lp as *mut HashSet<u32>)).insert(pid);
+            windowed.insert(pid);
+            if IsHungAppWindow(hwnd) != 0 {
+                hung.insert(pid);
+            }
         }
         1
     }
-    let mut set = HashSet::new();
-    unsafe { EnumWindows(Some(visit), &mut set as *mut _ as LPARAM) };
-    set
+    let mut sets = (HashSet::new(), HashSet::new());
+    unsafe { EnumWindows(Some(visit), &mut sets as *mut _ as LPARAM) };
+    sets
 }
 
 fn enrich_loop(rx: Receiver<Arc<ImageInfo>>, shared: Arc<Shared>) {

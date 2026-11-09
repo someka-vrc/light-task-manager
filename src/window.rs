@@ -4,6 +4,7 @@ use crate::actions;
 use crate::core::{Caption, Core};
 use crate::gfx::rect;
 use crate::pages::{Cmd, Cursor, Ev};
+use crate::pointer::{Gesture, Out, HOLD_MS};
 use crate::sampler::{self, Shared, WM_APP_ENRICHED, WM_APP_SNAPSHOT};
 use crate::settings::Settings;
 use crate::theme::THEME;
@@ -20,9 +21,14 @@ use windows_sys::Win32::UI::HiDpi::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
+windows_targets::link!("user32.dll" "system" fn GetPointerType(id: u32, kind: *mut POINTER_INPUT_TYPE) -> BOOL);
+
 const TIMER_ANIM: usize = 1;
+const TIMER_HOLD: usize = 2;
 const EDIT_ID: usize = 100;
 const EDIT_MARGIN: isize = 0;
+const TOUCH_SLOP: i32 = 10;
+const PEN_SLOP: i32 = 5;
 
 static ORIGINAL_EDIT_PROC: AtomicIsize = AtomicIsize::new(0);
 static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -47,6 +53,8 @@ struct App {
     nc_tracking: bool,
     pressed_caption: Option<Caption>,
     capturing: bool,
+    gesture: Gesture,
+    started: Instant,
 }
 
 /// Asks Windows for dark native menus. These entry points are unnamed, so a
@@ -268,6 +276,8 @@ unsafe fn create(hwnd: HWND, cs: &CREATESTRUCTW) -> Box<App> {
         nc_tracking: false,
         pressed_caption: None,
         capturing: false,
+        gesture: Gesture::new(),
+        started: Instant::now(),
     })
 }
 
@@ -360,6 +370,84 @@ impl App {
         }
     }
 
+    unsafe fn focus_for_press(&mut self, x: i32, y: i32) {
+        if GetFocus() != self.edit || !self.core.search_rect().contains(x, y) {
+            SetFocus(self.hwnd);
+        }
+    }
+
+    unsafe fn dispatch(&mut self, out: Vec<Out>) {
+        for o in out {
+            match o {
+                Out::Move { x, y } => self.fire(Ev::Move { x, y }),
+                Out::Press { x, y, right } => {
+                    self.focus_for_press(x, y);
+                    self.fire(Ev::Down { x, y, right });
+                }
+                Out::Release { x } => self.fire(Ev::Up { x }),
+                Out::Pan { dx, dy } => self.fire(Ev::Pan { dx, dy }),
+                Out::Fling { vx, vy } => self.fire(Ev::Fling { vx, vy }),
+            }
+        }
+    }
+
+    /// Handles touch and pen. Returns false to leave the message to Windows.
+    /// Contacts are captured to this window by the system.
+    unsafe fn on_pointer(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> bool {
+        let id = (wp & 0xFFFF) as u32;
+        let flags = ((wp >> 16) & 0xFFFF) as u32;
+        let mut kind: POINTER_INPUT_TYPE = 0;
+        if GetPointerType(id, &mut kind) == 0 || (kind != PT_TOUCH && kind != PT_PEN) {
+            return false;
+        }
+        self.core.touch = kind == PT_TOUCH;
+        let mut p = POINT { x: lo(lp), y: hi(lp) };
+        ScreenToClient(self.hwnd, &mut p);
+        let at = (p.x, p.y);
+        let t = self.started.elapsed().as_secs_f64();
+        let mut out = Vec::new();
+        match msg {
+            WM_POINTERDOWN => {
+                if !self.gesture.idle() || flags & POINTER_MESSAGE_FLAG_PRIMARY == 0 {
+                    return true;
+                }
+                self.fire(Ev::Fling { vx: 0.0, vy: 0.0 });
+                let slop = if kind == PT_TOUCH { TOUCH_SLOP } else { PEN_SLOP };
+                let slop = self.core.canvas.px(slop);
+                let pannable = self.core.pannable(p.x, p.y);
+                let barrel = kind == PT_PEN && flags & POINTER_MESSAGE_FLAG_SECONDBUTTON != 0;
+                self.gesture.down(id, at, t, slop, pannable, barrel, &mut out);
+                if self.gesture.pending() {
+                    SetTimer(self.hwnd, TIMER_HOLD, HOLD_MS, None);
+                }
+            }
+            WM_POINTERUPDATE if flags & POINTER_MESSAGE_FLAG_INCONTACT != 0 => {
+                self.gesture.update(id, at, t, &mut out);
+            }
+            WM_POINTERUPDATE => {
+                if kind == PT_PEN && self.gesture.idle() {
+                    self.fire(Ev::Move { x: p.x, y: p.y });
+                }
+            }
+            WM_POINTERUP => {
+                let canceled = flags & POINTER_MESSAGE_FLAG_CANCELED != 0;
+                self.gesture.up(id, t, canceled, &mut out);
+            }
+            WM_POINTERCAPTURECHANGED => self.gesture.up(id, t, true, &mut out),
+            WM_POINTERLEAVE => {
+                if self.gesture.idle() {
+                    self.fire(Ev::Leave);
+                }
+            }
+            _ => {}
+        }
+        if !self.gesture.pending() {
+            KillTimer(self.hwnd, TIMER_HOLD);
+        }
+        self.dispatch(out);
+        true
+    }
+
     unsafe fn save(&mut self) {
         let mut placement: WINDOWPLACEMENT = std::mem::zeroed();
         placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
@@ -392,6 +480,15 @@ impl App {
             return HTCAPTION;
         }
         HTCLIENT
+    }
+}
+
+fn caption_of(hit: u32) -> Option<Caption> {
+    match hit {
+        HTMINBUTTON => Some(Caption::Minimize),
+        HTMAXBUTTON => Some(Caption::Maximize),
+        HTCLOSE => Some(Caption::Close),
+        _ => None,
     }
 }
 
@@ -490,12 +587,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             app.hit_test(lo(lp), hi(lp)) as LRESULT
         }
         WM_NCMOUSEMOVE => {
-            let caption = match wp as u32 {
-                HTMINBUTTON => Some(Caption::Minimize),
-                HTMAXBUTTON => Some(Caption::Maximize),
-                HTCLOSE => Some(Caption::Close),
-                _ => None,
-            };
+            let caption = caption_of(wp as u32);
             if caption.is_some() && !app.nc_tracking {
                 let mut t = TRACKMOUSEEVENT {
                     cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -516,16 +608,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_NCLBUTTONDOWN if matches!(wp as u32, HTMINBUTTON | HTMAXBUTTON | HTCLOSE) => {
-            app.pressed_caption = app.core.caption_hover;
+            // A tap has no hover before it, so trust the hit test here.
+            app.pressed_caption = caption_of(wp as u32);
             0
         }
         WM_NCLBUTTONUP if matches!(wp as u32, HTMINBUTTON | HTMAXBUTTON | HTCLOSE) => {
             if let Some(c) = app.pressed_caption.take() {
-                if app.core.caption_hover == Some(c) {
+                if caption_of(wp as u32) == Some(c) {
                     app.caption_action(c);
                 }
             }
             0
+        }
+        WM_POINTERDOWN | WM_POINTERUPDATE | WM_POINTERUP | WM_POINTERLEAVE | WM_POINTERCAPTURECHANGED => {
+            if app.on_pointer(msg, wp, lp) {
+                0
+            } else {
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
         }
         WM_ERASEBKGND => 1,
         WM_PAINT => {
@@ -593,6 +693,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             1
         }
         WM_MOUSEMOVE => {
+            app.core.touch = false;
             app.track_leave();
             if app.core.caption_hover.is_some() {
                 app.core.caption_hover = None;
@@ -607,14 +708,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_RBUTTONDOWN => {
-            if GetFocus() == app.edit {
-                let hit_search = app.core.search_rect().contains(lo(lp), hi(lp));
-                if !hit_search {
-                    SetFocus(hwnd);
-                }
-            } else {
-                SetFocus(hwnd);
-            }
+            app.core.touch = false;
+            app.focus_for_press(lo(lp), hi(lp));
             SetCapture(hwnd);
             app.capturing = true;
             app.fire(Ev::Down { x: lo(lp), y: hi(lp), right: msg == WM_RBUTTONDOWN });
@@ -647,6 +742,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let dt = (now - app.last_tick).as_secs_f32().min(0.05);
             app.last_tick = now;
             app.fire(Ev::Tick { dt });
+            0
+        }
+        WM_TIMER if wp == TIMER_HOLD => {
+            KillTimer(hwnd, TIMER_HOLD);
+            let mut out = Vec::new();
+            app.gesture.hold(&mut out);
+            app.dispatch(out);
             0
         }
         WM_KEYDOWN => {

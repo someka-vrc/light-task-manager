@@ -7,6 +7,7 @@ pub struct Settings {
     pub columns: Vec<(Col, u16)>,
     pub sort: Col,
     pub descending: bool,
+    pub group: bool,
     pub interval_ms: u32,
     pub sidebar_expanded: bool,
     pub width: i32,
@@ -20,6 +21,7 @@ impl Default for Settings {
             columns: columns::defaults(),
             sort: Col::ActivePrivate,
             descending: true,
+            group: true,
             interval_ms: 1000,
             sidebar_expanded: false,
             width: 1240,
@@ -57,6 +59,7 @@ impl Settings {
                     }
                 }
                 "descending" => s.descending = value == "1",
+                "group" => s.group = value == "1",
                 "interval" => s.interval_ms = value.parse().unwrap_or(1000),
                 "sidebar" => s.sidebar_expanded = value == "1",
                 "width" => s.width = value.parse().unwrap_or(s.width),
@@ -79,10 +82,11 @@ impl Settings {
             .map(|(c, w)| format!("{}:{}", columns::def(*c).key, w))
             .collect();
         let text = format!(
-            "columns={}\nsort={}\ndescending={}\ninterval={}\nsidebar={}\nwidth={}\nheight={}\nmaximized={}\n",
+            "columns={}\nsort={}\ndescending={}\ngroup={}\ninterval={}\nsidebar={}\nwidth={}\nheight={}\nmaximized={}\n",
             cols.join(","),
             columns::def(self.sort).key,
             self.descending as u8,
+            self.group as u8,
             self.interval_ms,
             self.sidebar_expanded as u8,
             self.width,
