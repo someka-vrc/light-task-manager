@@ -984,8 +984,10 @@ impl DetailsPage {
         let t = THEME;
         let l = &self.l;
         let area = l.area;
-        let toolbar = rect(area.x + c.px(20), area.y, c.px(80), c.px(60));
-        c.text("詳細", Font::Title, toolbar, t.text, Align::Left);
+        let title = "プロセス";
+        let title_w = c.measure(title, Font::Title);
+        let toolbar = rect(area.x + c.px(20), area.y, title_w + c.px(4), c.px(60));
+        c.text(title, Font::Title, toolbar, t.text, Align::Left);
 
         let shown = self.view.iter().filter(|r| !matches!(r, Row::Group(_))).count();
         let total = self.snap.procs.len();
@@ -1000,7 +1002,7 @@ impl DetailsPage {
         } else {
             format!("{shown} / {total} プロセス")
         };
-        let info_x = area.x + c.px(84);
+        let info_x = toolbar.r() + c.px(12);
         let info_w = l.group_btn.x - info_x - c.px(12);
         c.text(&info, Font::Small, rect(info_x, area.y + c.px(3), info_w, c.px(60)), t.text_dim, Align::Left);
 
@@ -1310,7 +1312,7 @@ impl Page for DetailsPage {
     fn nav(&self) -> Nav {
         Nav {
             icon: icons::LIST,
-            label: "詳細",
+            label: "プロセス",
             bottom: false,
         }
     }

@@ -5,6 +5,7 @@
 //! only once per process, when it first appears.
 
 use crate::model::*;
+use crate::sysinfo::SysSampler;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU32, Ordering};
@@ -115,6 +116,8 @@ pub struct Shared {
     pub wake: AtomicIsize,
     pub icon_px: AtomicI32,
     pub enrich_posted: AtomicBool,
+    /// GPU counters are costly, so they are read only while the performance page is open.
+    pub want_gpu: AtomicBool,
     force: AtomicBool,
 }
 
@@ -130,6 +133,7 @@ impl Shared {
             wake: AtomicIsize::new(wake as isize),
             icon_px: AtomicI32::new(16),
             enrich_posted: AtomicBool::new(false),
+            want_gpu: AtomicBool::new(false),
             force: AtomicBool::new(true),
         })
     }
@@ -167,6 +171,7 @@ pub struct Sampler {
     last_sample: Option<Instant>,
     ncpu: f64,
     generation: u64,
+    sys: SysSampler,
 }
 
 pub fn start(shared: Arc<Shared>) {
@@ -217,6 +222,7 @@ impl Sampler {
             last_sample: None,
             ncpu,
             generation: 0,
+            sys: SysSampler::new(),
         }
     }
 
@@ -381,6 +387,8 @@ impl Sampler {
         unsafe { GlobalMemoryStatusEx(&mut mem) };
         snap.mem_total = mem.ullTotalPhys;
         snap.mem_used = mem.ullTotalPhys - mem.ullAvailPhys;
+        let want_gpu = self.shared.want_gpu.load(Ordering::Relaxed);
+        snap.sys = self.sys.sample(&snap.procs, want_gpu);
         snap
     }
 
@@ -719,6 +727,12 @@ fn enrich_loop(rx: Receiver<Arc<ImageInfo>>, shared: Arc<Shared>) {
 }
 
 fn file_description(path: &[u16]) -> String {
+    version_string(path, "FileDescription")
+}
+
+/// Reads a string such as "FileDescription" or "CompanyName" from a file's
+/// version resource, preferring the Japanese translation.
+pub fn version_string(path: &[u16], name: &str) -> String {
     const FILE_VER_GET_LOCALISED: u32 = 1;
     unsafe {
         let mut dummy = 0;
@@ -748,7 +762,7 @@ fn file_description(path: &[u16]) -> String {
         let japanese = pairs.iter().find(|p| p[0] == 0x0411);
         for pair in japanese.into_iter().chain(pairs.iter()) {
             let key = format!(
-                "\\StringFileInfo\\{:04x}{:04x}\\FileDescription\0",
+                "\\StringFileInfo\\{:04x}{:04x}\\{name}\0",
                 pair[0], pair[1]
             );
             let key: Vec<u16> = key.encode_utf16().collect();
@@ -764,7 +778,7 @@ fn file_description(path: &[u16]) -> String {
     }
 }
 
-fn load_icon(path: &[u16], size: i32) -> Option<Icon> {
+pub fn load_icon(path: &[u16], size: i32) -> Option<Icon> {
     unsafe {
         let mut icon: HICON = std::ptr::null_mut();
         let mut id = 0;

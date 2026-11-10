@@ -1,8 +1,13 @@
 //! Page abstraction. To add a page, implement `Page` and list it in `all()`.
 
 pub mod details;
+pub mod history;
 pub mod performance;
+pub mod services;
 pub mod settings;
+pub mod startup;
+pub mod users;
+pub mod widgets;
 
 use crate::gfx::{Canvas, Rect};
 use crate::model::Snapshot;
@@ -30,6 +35,8 @@ pub enum Cmd {
     Toast(String),
     FocusFilter,
     Elevate,
+    /// Switch to the details page filtered to this PID.
+    ShowProcess(u32),
 }
 
 pub struct Cx<'a> {
@@ -65,6 +72,12 @@ pub trait Page {
     fn set_filter(&mut self, _text: &str, _cx: &mut Cx) {}
     fn on_snapshot(&mut self, _snap: &Arc<Snapshot>, _cx: &mut Cx) {}
     fn on_enriched(&mut self, _cx: &mut Cx) {}
+    /// Called when the page becomes the active page.
+    fn on_show(&mut self, _cx: &mut Cx) {}
+    /// Called when another page becomes active.
+    fn on_hide(&mut self, _cx: &mut Cx) {}
+    /// Called once when the window closes, before settings are saved.
+    fn on_exit(&mut self) {}
     fn animating(&self) -> bool {
         false
     }
@@ -80,7 +93,11 @@ pub trait Page {
 pub fn all() -> Vec<Box<dyn Page>> {
     vec![
         Box::new(details::DetailsPage::new()),
-        Box::new(performance::PerformancePage),
+        Box::new(performance::PerformancePage::new()),
+        Box::new(history::HistoryPage::new()),
+        Box::new(startup::StartupPage::new()),
+        Box::new(users::UsersPage::new()),
+        Box::new(services::ServicesPage::new()),
         Box::new(settings::SettingsPage::new()),
     ]
 }
@@ -103,6 +120,17 @@ pub mod icons {
     pub const BLOCK: char = '\u{E8D8}';
     pub const COLUMNS: char = '\u{E9D5}';
     pub const CLEAR: char = '\u{E711}';
+    pub const HISTORY: char = '\u{E81C}';
+    pub const STARTUP: char = '\u{EC4A}';
+    pub const PEOPLE: char = '\u{E716}';
+    pub const SERVICES: char = '\u{E912}';
+    pub const PLAY: char = '\u{E768}';
+    pub const STOP: char = '\u{E71A}';
+    pub const REFRESH: char = '\u{E72C}';
+    pub const FOLDER: char = '\u{E838}';
+    pub const DISCONNECT: char = '\u{E8CD}';
+    pub const SIGN_OUT: char = '\u{F3B1}';
+    pub const DELETE: char = '\u{E74D}';
 }
 
 pub fn glyph(ch: char) -> String {

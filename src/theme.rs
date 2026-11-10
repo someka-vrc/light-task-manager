@@ -16,6 +16,12 @@ pub struct Theme {
     pub popup: u32,
     pub danger: u32,
     pub warn: u32,
+    pub chart_cpu: u32,
+    pub chart_mem: u32,
+    pub chart_disk: u32,
+    pub chart_net: u32,
+    pub chart_gpu: u32,
+    pub chart_grid: u32,
 }
 
 pub static DARK: Theme = Theme {
@@ -34,6 +40,12 @@ pub static DARK: Theme = Theme {
     popup: 0x2C2C33,
     danger: 0xC42B3A,
     warn: 0xFFB454,
+    chart_cpu: 0x4FA8F0,
+    chart_mem: 0xA77BF0,
+    chart_disk: 0x6CC66A,
+    chart_net: 0xE0904A,
+    chart_gpu: 0x3EC7C0,
+    chart_grid: 0x303038,
 };
 
 pub static THEME: &Theme = &DARK;

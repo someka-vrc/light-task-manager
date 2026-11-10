@@ -211,6 +211,21 @@ impl Core {
         }
     }
 
+    pub fn navigate(&mut self, i: usize) {
+        if i == self.active || i >= self.pages.len() {
+            return;
+        }
+        self.with_page(|p, cx| {
+            p.event(&Ev::Leave, cx);
+            p.on_hide(cx);
+        });
+        self.active = i;
+        self.with_page(|p, cx| p.on_show(cx));
+        let text = self.filter_text.clone();
+        self.with_page(|p, cx| p.set_filter(&text, cx));
+        self.dirty = true;
+    }
+
     pub fn on_enriched(&mut self) {
         self.with_page(|p, cx| p.on_enriched(cx));
     }
@@ -272,15 +287,7 @@ impl Core {
                     self.settings.sidebar_expanded = !self.settings.sidebar_expanded;
                     self.dirty = true;
                 }
-                Hover::Nav(i) if !right => {
-                    if i != self.active {
-                        self.with_page(|p, cx| p.event(&Ev::Leave, cx));
-                        self.active = i;
-                        let text = self.filter_text.clone();
-                        self.with_page(|p, cx| p.set_filter(&text, cx));
-                        self.dirty = true;
-                    }
-                }
+                Hover::Nav(i) if !right => self.navigate(i),
                 Hover::Clear => clear_filter = true,
                 Hover::Search => self.cmds.push(Cmd::FocusFilter),
                 _ => {

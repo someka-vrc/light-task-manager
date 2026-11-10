@@ -308,6 +308,12 @@ impl App {
                 Cmd::FocusFilter => {
                     SetFocus(self.edit);
                 }
+                Cmd::ShowProcess(pid) => {
+                    self.core.navigate(0);
+                    self.place_edit();
+                    // EN_CHANGE applies the filter.
+                    SetWindowTextW(self.edit, wide(&pid.to_string()).as_ptr());
+                }
                 Cmd::Elevate => {
                     if actions::relaunch_elevated() {
                         PostMessageW(self.hwnd, WM_CLOSE, 0, 0);
@@ -459,6 +465,9 @@ impl App {
         s.height = ((r.bottom - r.top) as f32 / scale) as i32;
         s.maximized = IsZoomed(self.hwnd) != 0;
         s.save();
+        for page in &mut self.core.pages {
+            page.on_exit();
+        }
     }
 
     unsafe fn hit_test(&self, screen_x: i32, screen_y: i32) -> u32 {

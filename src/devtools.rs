@@ -1,4 +1,4 @@
-//! Headless developer tools: `--bench <out.txt>` and `--shot <out.bmp> [filter]`.
+//! Headless developer tools: `--bench <out.txt>` and `--shot <out.bmp> [page] [expand] [extra samples]`.
 
 use crate::core::Core;
 use crate::model::{Proc, ProcStatic, Snapshot};
@@ -48,6 +48,7 @@ fn inflate(base: &Snapshot, rows: usize) -> Arc<Snapshot> {
         cpu_total: base.cpu_total,
         mem_total: base.mem_total,
         mem_used: base.mem_used,
+        sys: base.sys.clone(),
     })
 }
 
@@ -129,9 +130,19 @@ pub fn shot(args: &[String]) {
     let shared = Shared::new();
     let live = live_snapshot(&shared);
     let mut core = Core::new(Settings::default(), shared.clone(), 1.0, 1240, 760);
-    core.active = page;
+    core.navigate(page);
     core.on_snapshot(&live);
-    if args.get(2).is_some_and(|a| a == "expand") {
+    let extra = &args[2.min(args.len())..];
+    // A few more samples give the performance graphs some history.
+    let samples = extra.iter().find_map(|a| a.parse::<u32>().ok()).unwrap_or(0);
+    for _ in 0..samples {
+        std::thread::sleep(Duration::from_millis(1050));
+        let next = shared.slot.lock().unwrap().take();
+        if let Some(snap) = next {
+            core.on_snapshot(&snap);
+        }
+    }
+    if extra.iter().any(|a| a == "expand") {
         core.page_is_details().unwrap().expand_all_for_test();
     }
     core.render();

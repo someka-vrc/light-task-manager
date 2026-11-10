@@ -44,6 +44,14 @@ pub fn open_location(path: &str) {
     }
 }
 
+/// Opens a file, folder, URL or shell target with its default handler.
+pub fn shell_open(target: &str) {
+    let (verb, file) = (wide("open"), wide(target));
+    unsafe {
+        ShellExecuteW(null_mut(), verb.as_ptr(), file.as_ptr(), null(), null(), SW_SHOWNORMAL);
+    }
+}
+
 pub fn properties(path: &str) {
     let (verb, file) = (wide("properties"), wide(path));
     unsafe {

@@ -111,4 +111,119 @@ pub struct Snapshot {
     pub cpu_total: f32,
     pub mem_total: u64,
     pub mem_used: u64,
+    pub sys: SysSample,
+}
+
+/// Machine-wide counters for the performance page, taken with each snapshot.
+#[derive(Default, Clone)]
+pub struct SysSample {
+    /// Seconds since the previous sample; 0 on the first one.
+    pub elapsed: f32,
+    pub cpu: CpuSample,
+    pub mem: MemSample,
+    pub disks: Vec<DiskSample>,
+    pub nets: Vec<NetSample>,
+    pub gpus: Vec<GpuSample>,
+    pub info: Arc<SysStatic>,
+}
+
+#[derive(Default, Clone)]
+pub struct CpuSample {
+    /// Percent per logical processor.
+    pub cores: Vec<f32>,
+    pub total: f32,
+    pub kernel: f32,
+    /// Current clock in MHz, 0 when unknown.
+    pub mhz: f32,
+    pub processes: u32,
+    pub threads: u32,
+    pub handles: u32,
+    pub uptime_ms: u64,
+}
+
+#[derive(Default, Clone)]
+pub struct MemSample {
+    pub total: u64,
+    pub available: u64,
+    pub commit: u64,
+    pub commit_limit: u64,
+    pub cached: u64,
+    pub paged_pool: u64,
+    pub nonpaged_pool: u64,
+    pub compressed: u64,
+    pub modified: u64,
+    pub standby: u64,
+    pub free: u64,
+}
+
+#[derive(Default, Clone)]
+pub struct DiskSample {
+    /// The physical disk number.
+    pub index: u32,
+    /// Drive letters, e.g. "C: D:".
+    pub letters: String,
+    pub active: f32,
+    pub read_bps: f64,
+    pub write_bps: f64,
+    /// Average response time in milliseconds.
+    pub response_ms: f64,
+    pub info: Arc<DiskStatic>,
+}
+
+#[derive(Default)]
+pub struct DiskStatic {
+    pub model: String,
+    /// "SSD (NVMe)", "HDD (SATA)" and so on.
+    pub kind: String,
+    pub capacity: u64,
+    pub removable: bool,
+}
+
+#[derive(Default, Clone)]
+pub struct NetSample {
+    pub index: u32,
+    /// "Wi-Fi" or "イーサネット".
+    pub kind: &'static str,
+    pub alias: String,
+    pub description: String,
+    pub send_bps: f64,
+    pub recv_bps: f64,
+    /// Link speed in bits per second.
+    pub link_bps: u64,
+    pub ipv4: String,
+    pub ipv6: String,
+}
+
+#[derive(Default, Clone)]
+pub struct GpuSample {
+    /// The adapter LUID as written in performance counter instance names.
+    pub luid: String,
+    pub name: String,
+    /// The busiest engine, in percent.
+    pub util: f32,
+    /// Engine type and percent, busiest first.
+    pub engines: Vec<(String, f32)>,
+    pub dedicated: u64,
+    pub dedicated_total: u64,
+    pub shared: u64,
+    pub shared_total: u64,
+}
+
+/// Facts about the machine that do not change while the app runs.
+#[derive(Default)]
+pub struct SysStatic {
+    pub cpu_name: String,
+    pub base_mhz: u32,
+    pub sockets: u32,
+    pub cores: u32,
+    pub logical: u32,
+    pub l1: u64,
+    pub l2: u64,
+    pub l3: u64,
+    pub installed_mem: u64,
+    pub mem_type: String,
+    pub mem_speed: u32,
+    pub slots_used: u32,
+    pub slots_total: u32,
+    pub form_factor: String,
 }

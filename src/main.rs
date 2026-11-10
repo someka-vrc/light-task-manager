@@ -11,6 +11,7 @@ mod pages;
 mod pointer;
 mod sampler;
 mod settings;
+mod sysinfo;
 mod theme;
 mod window;
 

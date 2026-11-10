@@ -45,10 +45,15 @@ pub enum Font {
     Title,
     Icon,
     IconSmall,
+    #[allow(dead_code)]
     IconLarge,
+    /// Large numbers on the performance page.
+    Value,
+    /// Large page heading on the performance page.
+    Display,
 }
 
-const FONT_COUNT: usize = 7;
+const FONT_COUNT: usize = 9;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Align {
@@ -184,6 +189,8 @@ impl Canvas {
             ("Segoe Fluent Icons", "Segoe Fluent Icons", 16, true),
             ("Segoe Fluent Icons", "Segoe Fluent Icons", 11, true),
             ("Segoe Fluent Icons", "Segoe Fluent Icons", 44, true),
+            (body.0, "Yu Gothic UI", 20, false),
+            (body.2, "Yu Gothic UI Semibold", 28, false),
         ];
         for (i, (latin, cjk, size, icon)) in specs.iter().enumerate() {
             let px = self.px(*size);
