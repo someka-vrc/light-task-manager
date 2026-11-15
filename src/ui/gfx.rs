@@ -1,6 +1,8 @@
 //! CPU-only drawing: a 32-bit DIB filled by hand, with GDI used for text.
 
-use crate::model::Icon;
+use crate::i18n::FontFace;
+use crate::system::model::Icon;
+use crate::system::win::wide;
 use std::ptr::null_mut;
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
@@ -45,10 +47,17 @@ pub enum Font {
     Title,
     Icon,
     IconSmall,
+    #[allow(dead_code)]
     IconLarge,
+    /// Large numbers on the performance page.
+    Value,
+    /// Large page heading on the performance page.
+    Display,
+    /// Small, in semibold.
+    SmallSemi,
 }
 
-const FONT_COUNT: usize = 7;
+const FONT_COUNT: usize = 10;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Align {
@@ -82,10 +91,9 @@ pub struct Canvas {
     current_color: u32,
     wide: Vec<u16>,
     pub scale: f32,
-}
-
-fn wide_z(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain([0]).collect()
+    /// Tooltips of what was painted this frame: the area and its text, in paint order.
+    /// The core shows the one under the mouse after the frame.
+    pub tips: Vec<(Rect, String)>,
 }
 
 fn font_exists(hdc: HDC, name: &str) -> bool {
@@ -102,29 +110,29 @@ fn font_exists(hdc: HDC, name: &str) -> bool {
     for (i, c) in name.encode_utf16().take(31).enumerate() {
         lf.lfFaceName[i] = c;
     }
-    lf.lfCharSet = DEFAULT_CHARSET as u8;
+    lf.lfCharSet = DEFAULT_CHARSET;
     let mut exists = false;
     unsafe { EnumFontFamiliesExW(hdc, &lf, Some(found), &mut exists as *mut bool as LPARAM, 0) };
     exists
 }
 
-fn make_font(name: &str, px: i32) -> HFONT {
-    let wide = wide_z(name);
+fn make_font(name: &str, weight: i32, px: i32) -> HFONT {
+    let wide = wide(name);
     unsafe {
         CreateFontW(
             -px,
             0,
             0,
             0,
-            FW_NORMAL as i32,
+            weight,
             0,
             0,
             0,
             DEFAULT_CHARSET as u32,
             OUT_TT_PRECIS as u32,
             CLIP_DEFAULT_PRECIS as u32,
-            CLEARTYPE_NATURAL_QUALITY as u32,
-            (DEFAULT_PITCH | FF_DONTCARE as u8) as u32,
+            CLEARTYPE_NATURAL_QUALITY,
+            (DEFAULT_PITCH | FF_DONTCARE) as u32,
             wide.as_ptr(),
         )
     }
@@ -135,7 +143,7 @@ impl Canvas {
         let hdc = unsafe { CreateCompatibleDC(null_mut()) };
         unsafe {
             SetBkMode(hdc, TRANSPARENT as i32);
-            SetTextAlign(hdc, TA_BASELINE as u32);
+            SetTextAlign(hdc, TA_BASELINE);
         }
         let empty = Face {
             latin: null_mut(),
@@ -159,9 +167,22 @@ impl Canvas {
             current_color: u32::MAX,
             wide: Vec::with_capacity(512),
             scale,
+            tips: Vec::new(),
         };
         c.set_scale(scale);
         c
+    }
+
+    /// Gives an area (such as an icon-only button) a tooltip for this frame.
+    pub fn tip(&mut self, r: Rect, text: impl Into<String>) {
+        if r.w > 0 && r.h > 0 {
+            self.tips.push((r, text.into()));
+        }
+    }
+
+    /// Drops the tooltips painted so far, for a menu or dialog that covers them.
+    pub fn clear_tips(&mut self) {
+        self.tips.clear();
     }
 
     pub fn px(&self, v: i32) -> i32 {
@@ -176,18 +197,24 @@ impl Canvas {
         } else {
             ("Segoe UI", "Segoe UI Semibold", "Segoe UI Semibold")
         };
-        let specs: [(&str, &str, i32, bool); FONT_COUNT] = [
-            (body.0, "Yu Gothic UI", 13, false),
-            (body.1, "Yu Gothic UI Semibold", 13, false),
-            (body.0, "Yu Gothic UI", 12, false),
-            (body.2, "Yu Gothic UI Semibold", 20, false),
-            ("Segoe Fluent Icons", "Segoe Fluent Icons", 16, true),
-            ("Segoe Fluent Icons", "Segoe Fluent Icons", 11, true),
-            ("Segoe Fluent Icons", "Segoe Fluent Icons", 44, true),
+        // Text that is not ASCII uses the language's own faces.
+        let [regular, semi] = crate::i18n::current().fonts();
+        let icons = ("Segoe Fluent Icons", FW_NORMAL as i32);
+        let specs: [(&str, FontFace, i32, bool); FONT_COUNT] = [
+            (body.0, regular, 13, false),
+            (body.1, semi, 13, false),
+            (body.0, regular, 12, false),
+            (body.2, semi, 20, false),
+            (icons.0, icons, 16, true),
+            (icons.0, icons, 11, true),
+            (icons.0, icons, 44, true),
+            (body.0, regular, 20, false),
+            (body.2, semi, 28, false),
+            (body.1, semi, 12, false),
         ];
         for (i, (latin, cjk, size, icon)) in specs.iter().enumerate() {
             let px = self.px(*size);
-            let (latin, cjk) = (make_font(latin, px), make_font(cjk, px));
+            let (latin, cjk) = (make_font(latin, FW_NORMAL as i32, px), make_font(cjk.0, cjk.1, px));
             let mut tm: TEXTMETRICW = unsafe { std::mem::zeroed() };
             unsafe {
                 let previous = SelectObject(hdc, latin);

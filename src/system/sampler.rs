@@ -4,7 +4,10 @@
 //! without opening any of them, so a sample stays cheap. Handles are opened
 //! only once per process, when it first appears.
 
-use crate::model::*;
+use crate::system::demand::{need, Demand, Needs};
+use crate::system::model::*;
+use crate::system::model::ProcTotals;
+use crate::system::sysinfo::SysSampler;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU32, Ordering};
@@ -24,6 +27,7 @@ windows_targets::link!("ntdll.dll" "system" fn NtQuerySystemInformation(class: u
 windows_targets::link!("ntdll.dll" "system" fn NtQueryInformationProcess(h: HANDLE, class: u32, buf: *mut c_void, len: u32, ret: *mut u32) -> i32);
 windows_targets::link!("kernel32.dll" "system" fn IsWow64Process2(h: HANDLE, process: *mut u16, native: *mut u16) -> BOOL);
 windows_targets::link!("user32.dll" "system" fn PrivateExtractIconsW(file: *const u16, index: i32, cx: i32, cy: i32, icons: *mut HICON, ids: *mut u32, count: u32, flags: u32) -> u32);
+windows_targets::link!("kernel32.dll" "system" fn GetPackageFullName(h: HANDLE, len: *mut u32, name: *mut u16) -> i32);
 
 const UNKNOWN: &str = "—";
 const WTS_ANY_SESSION: u32 = 0xFFFFFFFE;
@@ -109,11 +113,12 @@ pub struct Shared {
     /// 0 pauses sampling.
     pub interval_ms: AtomicU32,
     pub minimized: AtomicBool,
-    pub want_gui_counts: AtomicBool,
     pub hwnd: AtomicIsize,
     pub wake: AtomicIsize,
     pub icon_px: AtomicI32,
     pub enrich_posted: AtomicBool,
+    /// What the pages need read; costly counters run only while something needs them.
+    pub demand: Demand,
     force: AtomicBool,
 }
 
@@ -124,13 +129,32 @@ impl Shared {
             slot: Mutex::new(None),
             interval_ms: AtomicU32::new(1000),
             minimized: AtomicBool::new(false),
-            want_gui_counts: AtomicBool::new(false),
             hwnd: AtomicIsize::new(0),
             wake: AtomicIsize::new(wake as isize),
             icon_px: AtomicI32::new(16),
             enrich_posted: AtomicBool::new(false),
+            demand: Demand::default(),
             force: AtomicBool::new(true),
         })
+    }
+
+    /// What has to be read now.
+    pub fn needs(&self) -> u32 {
+        self.demand.current(self.minimized.load(Ordering::Relaxed))
+    }
+
+    /// Replaces the pages' needs, and samples at once when something new is needed.
+    pub fn set_demand(&self, needs: Vec<Needs>) {
+        if self.demand.set_all(needs, self.minimized.load(Ordering::Relaxed)) {
+            self.poke();
+        }
+    }
+
+    /// Sets the page that is shown, and samples at once when it needs something new.
+    pub fn set_visible(&self, page: Option<usize>) {
+        if self.demand.set_visible(page, self.minimized.load(Ordering::Relaxed)) {
+            self.poke();
+        }
     }
 
     /// Makes the sampler take a fresh sample right away.
@@ -151,6 +175,7 @@ struct Prev {
     cpu_time: u64,
     ws: u64,
     page_faults: u32,
+    io_bytes: u64,
     stat: Arc<ProcStatic>,
     seen: u64,
 }
@@ -166,6 +191,10 @@ pub struct Sampler {
     last_sample: Option<Instant>,
     ncpu: f64,
     generation: u64,
+    sys: SysSampler,
+    /// Machine-wide samples were taken since the last full one, so the per-process
+    /// baselines are old: the next full sample shows no rates, only new baselines.
+    procs_stale: bool,
 }
 
 pub fn start(shared: Arc<Shared>) {
@@ -180,7 +209,7 @@ pub fn start(shared: Arc<Shared>) {
         .spawn(move || {
             let mut s = Sampler::new(shared.clone(), tx);
             loop {
-                let scheduled = !shared.minimized.load(Ordering::Relaxed)
+                let scheduled = shared.needs() & need::LIVE != 0
                     && shared.interval_ms.load(Ordering::Relaxed) != 0;
                 if shared.force.swap(false, Ordering::AcqRel) || scheduled {
                     publish(&shared, s.sample());
@@ -216,6 +245,8 @@ impl Sampler {
             last_sample: None,
             ncpu,
             generation: 0,
+            sys: SysSampler::new(),
+            procs_stale: false,
         }
     }
 
@@ -248,25 +279,51 @@ impl Sampler {
             .last_sample
             .map_or(0.0, |t| (now - t).as_secs_f64() * 1e7);
         self.last_sample = Some(now);
-        self.generation += 1;
-        let capacity = elapsed_100ns * self.ncpu;
-
-        let hung = hung_processes();
-        let want_gui = self.shared.want_gui_counts.load(Ordering::Relaxed);
-        let mut wts: Option<HashMap<u32, Arc<str>>> = None;
-        let mut idle_pct = 0.0f32;
+        let needs = self.shared.needs();
 
         let mut raw_list = Vec::with_capacity(512);
+        let mut totals = ProcTotals::default();
         let base = self.buf.as_ptr() as *const u8;
         let mut offset = 0usize;
         loop {
             let p = unsafe { &*(base.add(offset) as *const NtProcess) };
             raw_list.push(offset);
+            if p.pid != 0 && p.threads != 0 {
+                totals.processes += 1;
+                totals.threads += p.threads;
+                totals.handles += p.handles;
+                if nt_string(&p.name) == "Memory Compression" {
+                    totals.compressed = p.ws as u64;
+                }
+            }
             if p.next == 0 {
                 break;
             }
             offset += p.next as usize;
         }
+
+        // Machine-wide only: no per-process work, and the per-process counters close.
+        if needs & need::PROCS == 0 {
+            self.procs_stale = true;
+            self.sys.proc_gpu(false);
+            self.sys.proc_net(false, 0.0);
+            snap.sys = self.sys.sample(&totals, needs & need::SYS_GPU != 0);
+            snap.cpu_total = snap.sys.cpu.total;
+            snap.mem_total = snap.sys.mem.total;
+            snap.mem_used = snap.sys.mem.total.saturating_sub(snap.sys.mem.available);
+            return snap;
+        }
+        // After machine-wide samples the baselines are old, so this one only renews them.
+        let stale = std::mem::take(&mut self.procs_stale);
+        snap.has_procs = true;
+        self.generation += 1;
+        let capacity = elapsed_100ns * self.ncpu;
+
+        let (hung, windowed) = window_owners();
+        let want_gui = needs & need::GUI_COUNTS != 0;
+        let want_eco_qos = needs & need::ECO_QOS != 0;
+        let mut wts: Option<HashMap<u32, Arc<str>>> = None;
+        let mut idle_pct = 0.0f32;
 
         snap.procs.reserve(raw_list.len());
         for offset in raw_list {
@@ -290,23 +347,31 @@ impl Sampler {
             let ws = p.ws as u64;
             let page_faults = p.page_faults;
 
-            let (stat, cpu, ws_delta, pf_delta) = match self.prev.get(&key) {
+            let io_bytes = p.read_bytes as u64 + p.write_bytes as u64;
+            let (stat, cpu, ws_delta, pf_delta, disk_bps) = match self.prev.get(&key) {
+                Some(prev) if stale => (prev.stat.clone(), 0.0, 0, 0, 0),
                 Some(prev) => {
                     let cpu = if capacity > 0.0 {
                         (cpu_time.saturating_sub(prev.cpu_time) as f64 / capacity * 100.0) as f32
                     } else {
                         0.0
                     };
+                    let disk_bps = if elapsed_100ns > 0.0 {
+                        (io_bytes.saturating_sub(prev.io_bytes) as f64 / (elapsed_100ns / 1e7)) as u64
+                    } else {
+                        0
+                    };
                     (
                         prev.stat.clone(),
                         cpu,
                         ws as i64 - prev.ws as i64,
                         page_faults.saturating_sub(prev.page_faults),
+                        disk_bps,
                     )
                 }
                 None => {
                     let stat = self.discover(pid, name, &mut wts);
-                    (stat, 0.0, 0, 0)
+                    (stat, 0.0, 0, 0, 0)
                 }
             };
             self.prev.insert(
@@ -315,6 +380,7 @@ impl Sampler {
                     cpu_time,
                     ws,
                     page_faults,
+                    io_bytes,
                     stat: stat.clone(),
                     seen: self.generation,
                 },
@@ -325,6 +391,7 @@ impl Sampler {
 
             let private_ws = p.private_ws as u64;
             let (user_objects, gdi_objects) = if want_gui { gui_counts(pid) } else { (0, 0) };
+            let eco_qos = if want_eco_qos && pid > 4 { eco_qos_of(pid) } else { None };
             let status = if suspended {
                 Status::Suspended
             } else if hung.contains(&pid) {
@@ -339,12 +406,20 @@ impl Sampler {
                 stat,
                 status,
                 session: p.session,
+                has_window: windowed.contains(&pid),
                 cpu,
                 cpu_time,
                 cycles: p.cycles,
                 ws,
                 peak_ws: p.peak_ws as u64,
                 ws_delta,
+                disk_bps,
+                gpu_util: 0.0,
+                gpu_engine: String::new(),
+                gpu_dedicated: 0,
+                gpu_shared: 0,
+                net_bps: 0,
+                eco_qos,
                 private_ws,
                 active_private: if suspended { 0 } else { private_ws },
                 commit: p.private_pages as u64,
@@ -379,6 +454,30 @@ impl Sampler {
         unsafe { GlobalMemoryStatusEx(&mut mem) };
         snap.mem_total = mem.ullTotalPhys;
         snap.mem_used = mem.ullTotalPhys - mem.ullAvailPhys;
+        let want_proc_gpu = needs & need::PROC_GPU != 0;
+        let proc_gpu = self.sys.proc_gpu(want_proc_gpu);
+        if !proc_gpu.is_empty() {
+            for p in snap.procs.iter_mut() {
+                if let Some(g) = proc_gpu.get(&p.pid) {
+                    p.gpu_util = g.util;
+                    p.gpu_engine = g.engine.clone();
+                    p.gpu_dedicated = g.dedicated;
+                    p.gpu_shared = g.shared;
+                }
+            }
+        }
+        let want_proc_net = needs & need::PROC_NET != 0;
+        let proc_net = self.sys.proc_net(want_proc_net, elapsed_100ns / 1e7);
+        if !proc_net.is_empty() {
+            for p in snap.procs.iter_mut() {
+                p.net_bps = proc_net.get(&p.pid).copied().unwrap_or(0);
+            }
+        }
+        let want_gpu = needs & need::SYS_GPU != 0;
+        snap.sys = self.sys.sample(&totals, want_gpu);
+        if stale {
+            snap.cpu_total = snap.sys.cpu.total;
+        }
         snap
     }
 
@@ -390,7 +489,7 @@ impl Sampler {
     ) -> Arc<ProcStatic> {
         let name = match pid {
             0 => "System Idle Process".to_string(),
-            _ if name.is_empty() => "(不明)".to_string(),
+            _ if name.is_empty() => crate::i18n::tr().common.unknown_name.to_string(),
             _ => name,
         };
         if wts.is_none() {
@@ -401,14 +500,19 @@ impl Sampler {
         let mut arch = "";
         let mut elevated = None;
         let mut cmdline = String::new();
+        let mut package = None;
+        let mut protect = Protect::default();
         if pid > 4 {
             let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
             if !h.is_null() {
                 arch = architecture(h);
                 cmdline = command_line(h);
+                package = package_name(h);
+                protect.cfg_shadow_pair(h);
                 let mut token = std::ptr::null_mut();
                 if unsafe { OpenProcessToken(h, TOKEN_QUERY, &mut token) } != 0 {
                     elevated = token_elevated(token);
+                    protect.uac_virt = token_virtualized(token);
                     if user.is_none() {
                         user = self.token_user(token);
                     }
@@ -416,9 +520,22 @@ impl Sampler {
                 }
                 unsafe { CloseHandle(h) };
             }
+            // DEP and DPI need query rights that the limited handle does not carry.
+            let hq = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION, 0, pid) };
+            if !hq.is_null() {
+                protect.dep = dep_enabled(hq);
+                protect.dpi = dpi_awareness(hq);
+                unsafe { CloseHandle(hq) };
+            }
         }
+        let platform = match arch {
+            "x86" | "ARM" => 32,
+            "" => 0,
+            _ => 64,
+        };
 
         let image = if pid > 4 { self.image_for(pid) } else { None };
+        let system_dir = pid <= 4 || image.as_ref().is_some_and(|i| in_system_dir(&i.path));
         let user = user.unwrap_or_else(|| Arc::from(fallback_user(pid, &name)));
         Arc::new(ProcStatic {
             name,
@@ -427,18 +544,23 @@ impl Sampler {
             elevated,
             cmdline,
             image,
+            package,
+            platform,
+            system_dir,
+            protect,
         })
     }
 
     fn image_for(&mut self, pid: u32) -> Option<Arc<ImageInfo>> {
         let nt_path = image_path(pid)?;
-        let path = self.to_dos_path(&nt_path)?;
+        let path = self.dos_path(&nt_path)?;
         if let Some(i) = self.images.get(&path) {
             return Some(i.clone());
         }
         let info = Arc::new(ImageInfo {
             path: path.clone(),
             description: OnceLock::new(),
+            company: OnceLock::new(),
             icon: OnceLock::new(),
         });
         self.images.insert(path, info.clone());
@@ -446,7 +568,7 @@ impl Sampler {
         Some(info)
     }
 
-    fn to_dos_path(&mut self, nt: &str) -> Option<String> {
+    fn dos_path(&mut self, nt: &str) -> Option<String> {
         if !nt.starts_with('\\') {
             return Some(nt.to_string());
         }
@@ -538,11 +660,15 @@ impl Sampler {
     }
 }
 
+/// Kernel-owned pseudo processes, which have no image file.
+pub fn is_kernel_process(pid: u32, name: &str) -> bool {
+    pid <= 4 || matches!(name, "Registry" | "Memory Compression" | "Secure System")
+}
+
 /// Without admin rights Windows withholds the owner of most session 0
 /// processes. Only kernel-owned pseudo processes are certain to be SYSTEM.
 fn fallback_user(pid: u32, name: &str) -> &'static str {
-    let kernel = pid <= 4 || matches!(name, "Registry" | "Memory Compression" | "Secure System");
-    if kernel {
+    if is_kernel_process(pid, name) {
         "SYSTEM"
     } else {
         UNKNOWN
@@ -642,6 +768,15 @@ fn command_line(h: HANDLE) -> String {
     nt_string(unsafe { &*(buf.as_ptr() as *const NtString) })
 }
 
+fn package_name(h: HANDLE) -> Option<Arc<str>> {
+    let mut name = [0u16; 128];
+    let mut len = name.len() as u32;
+    if unsafe { GetPackageFullName(h, &mut len, name.as_mut_ptr()) } != 0 || len == 0 {
+        return None;
+    }
+    Some(Arc::from(String::from_utf16_lossy(&name[..len as usize - 1])))
+}
+
 fn token_elevated(token: HANDLE) -> Option<bool> {
     let mut e = TOKEN_ELEVATION { TokenIsElevated: 0 };
     let mut len = 0;
@@ -655,6 +790,109 @@ fn token_elevated(token: HANDLE) -> Option<bool> {
         )
     };
     (ok != 0).then_some(e.TokenIsElevated != 0)
+}
+
+windows_targets::link!("kernel32.dll" "system" fn GetProcessMitigationPolicy(h: HANDLE, policy: i32, buf: *mut c_void, len: usize) -> BOOL);
+windows_targets::link!("kernel32.dll" "system" fn GetProcessDEPPolicy(h: HANDLE, flags: *mut u32, permanent: *mut BOOL) -> BOOL);
+windows_targets::link!("kernel32.dll" "system" fn GetProcessInformation(h: HANDLE, class: i32, info: *mut c_void, len: u32) -> BOOL);
+windows_targets::link!("shcore.dll" "system" fn GetProcessDpiAwareness(h: HANDLE, value: *mut i32) -> i32);
+
+/// PROCESS_MITIGATION_POLICY values.
+const POLICY_CONTROL_FLOW_GUARD: i32 = 7;
+const POLICY_USER_SHADOW_STACK: i32 = 15;
+/// PROCESS_INFORMATION_CLASS value for ProcessPowerThrottling.
+const CLASS_POWER_THROTTLING: i32 = 4;
+
+#[repr(C)]
+struct PowerThrottlingState {
+    version: u32,
+    control_mask: u32,
+    state_mask: u32,
+}
+
+fn mitigation_flags(h: HANDLE, policy: i32) -> Option<u32> {
+    let mut flags = 0u32;
+    let ok = unsafe {
+        GetProcessMitigationPolicy(h, policy, (&mut flags as *mut u32).cast(), 4)
+    };
+    (ok != 0).then_some(flags)
+}
+
+impl Protect {
+    /// Reads Control Flow Guard and the user shadow stack (hardware-enforced stack protection).
+    fn cfg_shadow_pair(&mut self, h: HANDLE) {
+        self.cfg = mitigation_flags(h, POLICY_CONTROL_FLOW_GUARD).map(|f| f & 1 != 0);
+        // Bit 0: enabled (compatibility mode), bit 4: strict mode.
+        self.shadow = mitigation_flags(h, POLICY_USER_SHADOW_STACK).map(|f| {
+            if f & (1 << 4) != 0 {
+                2
+            } else if f & 1 != 0 {
+                1
+            } else {
+                0
+            }
+        });
+    }
+}
+
+fn eco_qos_of(pid: u32) -> Option<bool> {
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return None;
+        }
+        let out = eco_qos(h);
+        CloseHandle(h);
+        out
+    }
+}
+
+fn eco_qos(h: HANDLE) -> Option<bool> {
+    let mut state = PowerThrottlingState { version: 1, control_mask: 0, state_mask: 0 };
+    let ok = unsafe {
+        GetProcessInformation(
+            h,
+            CLASS_POWER_THROTTLING,
+            (&mut state as *mut PowerThrottlingState).cast(),
+            std::mem::size_of::<PowerThrottlingState>() as u32,
+        )
+    };
+    (ok != 0).then_some(state.control_mask & 1 != 0 && state.state_mask & 1 != 0)
+}
+
+fn dep_enabled(h: HANDLE) -> Option<bool> {
+    let mut flags = 0u32;
+    let mut permanent: BOOL = 0;
+    let ok = unsafe { GetProcessDEPPolicy(h, &mut flags, &mut permanent) };
+    (ok != 0).then_some(flags & 1 != 0)
+}
+
+/// 0 unaware, 1 system aware, 2 per-monitor aware.
+fn dpi_awareness(h: HANDLE) -> Option<u8> {
+    let mut value = 0i32;
+    let hr = unsafe { GetProcessDpiAwareness(h, &mut value) };
+    (hr == 0 && (0..=2).contains(&value)).then_some(value as u8)
+}
+
+fn token_virtualized(token: HANDLE) -> Option<bool> {
+    let mut v = 0u32;
+    let mut len = 0;
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenVirtualizationEnabled,
+            (&mut v as *mut u32).cast(),
+            4,
+            &mut len,
+        )
+    };
+    (ok != 0).then_some(v != 0)
+}
+
+/// Whether the path lies under the Windows folder.
+fn in_system_dir(path: &str) -> bool {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
+    path.get(..root.len()).is_some_and(|p| p.eq_ignore_ascii_case(&root))
 }
 
 fn gui_counts(pid: u32) -> (u32, u32) {
@@ -672,24 +910,30 @@ fn gui_counts(pid: u32) -> (u32, u32) {
     }
 }
 
-fn hung_processes() -> HashSet<u32> {
+/// Processes with a hung window, and processes with any visible window.
+fn window_owners() -> (HashSet<u32>, HashSet<u32>) {
     unsafe extern "system" fn visit(hwnd: HWND, lp: LPARAM) -> BOOL {
-        if IsWindowVisible(hwnd) != 0 && IsHungAppWindow(hwnd) != 0 {
+        if IsWindowVisible(hwnd) != 0 {
+            let (hung, windowed) = &mut *(lp as *mut (HashSet<u32>, HashSet<u32>));
             let mut pid = 0;
             GetWindowThreadProcessId(hwnd, &mut pid);
-            (*(lp as *mut HashSet<u32>)).insert(pid);
+            windowed.insert(pid);
+            if IsHungAppWindow(hwnd) != 0 {
+                hung.insert(pid);
+            }
         }
         1
     }
-    let mut set = HashSet::new();
-    unsafe { EnumWindows(Some(visit), &mut set as *mut _ as LPARAM) };
-    set
+    let mut sets = (HashSet::new(), HashSet::new());
+    unsafe { EnumWindows(Some(visit), &mut sets as *mut _ as LPARAM) };
+    sets
 }
 
 fn enrich_loop(rx: Receiver<Arc<ImageInfo>>, shared: Arc<Shared>) {
     while let Ok(image) = rx.recv() {
         let wide: Vec<u16> = image.path.encode_utf16().chain([0]).collect();
         let _ = image.description.set(Arc::from(file_description(&wide)));
+        let _ = image.company.set(Arc::from(version_string(&wide, "CompanyName")));
         let _ = image
             .icon
             .set(load_icon(&wide, shared.icon_px.load(Ordering::Relaxed)));
@@ -700,6 +944,12 @@ fn enrich_loop(rx: Receiver<Arc<ImageInfo>>, shared: Arc<Shared>) {
 }
 
 fn file_description(path: &[u16]) -> String {
+    version_string(path, "FileDescription")
+}
+
+/// Reads a string such as "FileDescription" or "CompanyName" from a file's
+/// version resource, preferring the Japanese translation.
+pub fn version_string(path: &[u16], name: &str) -> String {
     const FILE_VER_GET_LOCALISED: u32 = 1;
     unsafe {
         let mut dummy = 0;
@@ -729,7 +979,7 @@ fn file_description(path: &[u16]) -> String {
         let japanese = pairs.iter().find(|p| p[0] == 0x0411);
         for pair in japanese.into_iter().chain(pairs.iter()) {
             let key = format!(
-                "\\StringFileInfo\\{:04x}{:04x}\\FileDescription\0",
+                "\\StringFileInfo\\{:04x}{:04x}\\{name}\0",
                 pair[0], pair[1]
             );
             let key: Vec<u16> = key.encode_utf16().collect();
@@ -745,7 +995,7 @@ fn file_description(path: &[u16]) -> String {
     }
 }
 
-fn load_icon(path: &[u16], size: i32) -> Option<Icon> {
+pub fn load_icon(path: &[u16], size: i32) -> Option<Icon> {
     unsafe {
         let mut icon: HICON = std::ptr::null_mut();
         let mut id = 0;

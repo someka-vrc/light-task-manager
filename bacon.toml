@@ -1,0 +1,6 @@
+[jobs.build]
+command = [
+  "powershell", "-NoProfile", "-Command",
+  "Stop-Process -Name LightTaskManager -Force -ErrorAction SilentlyContinue; cargo build --color always"
+]
+need_stdout = false

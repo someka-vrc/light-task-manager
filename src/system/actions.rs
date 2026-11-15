@@ -1,5 +1,6 @@
 //! Operations on processes and the shell.
 
+use crate::system::win::wide;
 use std::ptr::{null, null_mut};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Security::*;
@@ -8,10 +9,6 @@ use windows_sys::Win32::System::Memory::*;
 use windows_sys::Win32::System::Threading::*;
 use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain([0]).collect()
-}
 
 /// Ends a process, checking the creation time so a reused PID is never hit.
 pub fn terminate(pid: u32, create_time: i64) -> Result<(), u32> {
@@ -41,6 +38,14 @@ pub fn open_location(path: &str) {
     let (verb, exe) = (wide("open"), wide("explorer.exe"));
     unsafe {
         ShellExecuteW(null_mut(), verb.as_ptr(), exe.as_ptr(), args.as_ptr(), null(), SW_SHOWNORMAL);
+    }
+}
+
+/// Opens a file, folder, URL or shell target with its default handler.
+pub fn shell_open(target: &str) {
+    let (verb, file) = (wide("open"), wide(target));
+    unsafe {
+        ShellExecuteW(null_mut(), verb.as_ptr(), file.as_ptr(), null(), null(), SW_SHOWNORMAL);
     }
 }
 
@@ -100,4 +105,14 @@ pub fn relaunch_elevated() -> bool {
         ShellExecuteW(null_mut(), verb.as_ptr(), file.as_ptr(), null(), null(), SW_SHOWNORMAL)
     };
     result as isize > 32
+}
+
+/// The window title, which says so while running elevated.
+pub fn app_title() -> &'static str {
+    static ELEVATED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ELEVATED.get_or_init(is_elevated) {
+        crate::i18n::tr().app.admin_title
+    } else {
+        "Light Task Manager"
+    }
 }

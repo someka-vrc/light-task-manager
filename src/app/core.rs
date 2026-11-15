@@ -1,11 +1,13 @@
 //! Window-independent application state: chrome, navigation and page routing.
 
-use crate::gfx::{rect, Align, Canvas, Font, Rect};
-use crate::model::Snapshot;
-use crate::pages::{self, glyph, icons, Cmd, Cursor, Cx, Ev, Page};
-use crate::sampler::Shared;
+use crate::i18n::tr;
+use crate::pages::{self, Cmd, Cursor, Cx, Ev, Page};
 use crate::settings::Settings;
-use crate::theme::THEME;
+use crate::system::model::Snapshot;
+use crate::system::sampler::Shared;
+use crate::ui::gfx::{rect, Align, Canvas, Font, Rect};
+use crate::ui::icons::{self, glyph};
+use crate::ui::theme::THEME;
 use std::sync::Arc;
 
 pub const TITLE_H: i32 = 40;
@@ -15,6 +17,10 @@ const SIDEBAR_SECONDS: f32 = 0.12;
 const NAV_H: i32 = 40;
 const TOAST_SECONDS: f32 = 4.5;
 const CAPTION_W: i32 = 46;
+/// Where the app title ends, in the scale-1 px of the title bar; the search box starts after it.
+const TITLE_END: i32 = 261;
+/// The app title is shown only when the window is at least this wide, so the search box keeps room.
+const TITLE_MIN_W: i32 = 580;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Caption {
@@ -44,10 +50,13 @@ pub struct Core {
     pub filter_focused: bool,
     pub filter_text: String,
     pub caption_hover: Option<Caption>,
+    pub touch: bool,
     sidebar: f32,
     hover: Hover,
     page_captured: bool,
     toast: Option<(String, f32)>,
+    /// Where the mouse is over the client area, for tooltips. None after a press until it moves.
+    mouse: Option<(i32, i32)>,
 }
 
 impl Core {
@@ -55,7 +64,7 @@ impl Core {
         let mut canvas = Canvas::new(scale);
         canvas.resize(w, h);
         let sidebar = if settings.sidebar_expanded { 1.0 } else { 0.0 };
-        Self {
+        let core = Self {
             canvas,
             settings,
             shared,
@@ -67,11 +76,22 @@ impl Core {
             filter_focused: false,
             filter_text: String::new(),
             caption_hover: None,
+            touch: false,
             sidebar,
             hover: Hover::None,
             page_captured: false,
             toast: None,
-        }
+            mouse: None,
+        };
+        core.shared.set_visible(Some(core.active));
+        core.refresh_demand();
+        core
+    }
+
+    /// Collects what every page needs read, for the sampler.
+    pub fn refresh_demand(&self) {
+        let needs = self.pages.iter().map(|p| p.demand(&self.settings)).collect();
+        self.shared.set_demand(needs);
     }
 
     fn px(&self, v: i32) -> i32 {
@@ -93,10 +113,23 @@ impl Core {
         rect(x, y, self.canvas.w - x, self.canvas.h - y)
     }
 
+    /// Centered in the title bar, but never over the app title, the sidebar or the caption
+    /// buttons. It shrinks to fit rather than disappear, so Ctrl+F always has a search box.
     pub fn search_rect(&self) -> Rect {
-        let w = self.px(420).min(self.canvas.w - self.px(420)).max(self.px(160));
+        // The app title comes first when it is shown: the search box starts after its width.
+        let sidebar_end = self.sidebar_w() + self.px(8);
+        let left = if self.title_shown() { (self.px(TITLE_END) + self.px(12)).max(sidebar_end) } else { sidebar_end };
+        let right = self.canvas.w - self.px(CAPTION_W) * 3 - self.px(8);
+        let avail = (right - left).max(0);
+        let w = self.px(420).min(avail);
         let h = self.px(30);
-        rect((self.canvas.w - w) / 2, (self.title_h() - h) / 2, w, h)
+        let x = ((self.canvas.w - w) / 2).clamp(left, (right - w).max(left));
+        rect(x, (self.title_h() - h) / 2, w, h)
+    }
+
+    /// The app title is dropped in narrow windows, so the search box keeps its room.
+    fn title_shown(&self) -> bool {
+        self.canvas.w >= self.px(TITLE_MIN_W)
     }
 
     fn clear_rect(&self) -> Rect {
@@ -114,6 +147,10 @@ impl Core {
 
     pub fn wants_filter(&self) -> bool {
         self.pages[self.active].wants_filter()
+    }
+
+    pub fn captures_text(&self) -> bool {
+        self.pages[self.active].captures_text()
     }
 
     fn caption_rect(&self, c: Caption) -> Rect {
@@ -187,8 +224,13 @@ impl Core {
             shared: &self.shared,
             cmds: &mut self.cmds,
             dirty: &mut self.dirty,
+            touch: self.touch,
         };
         f(&mut self.pages[self.active], &mut cx);
+    }
+
+    pub fn pannable(&self, x: i32, y: i32) -> bool {
+        self.pages[self.active].pannable(x, y)
     }
 
     pub fn on_snapshot(&mut self, snap: &Arc<Snapshot>) {
@@ -197,10 +239,27 @@ impl Core {
             shared: &self.shared,
             cmds: &mut self.cmds,
             dirty: &mut self.dirty,
+            touch: self.touch,
         };
         for page in &mut self.pages {
             page.on_snapshot(snap, &mut cx);
         }
+    }
+
+    pub fn navigate(&mut self, i: usize) {
+        if i == self.active || i >= self.pages.len() {
+            return;
+        }
+        self.with_page(|p, cx| {
+            p.event(&Ev::Leave, cx);
+            p.on_hide(cx);
+        });
+        self.active = i;
+        self.shared.set_visible(Some(i));
+        self.with_page(|p, cx| p.on_show(cx));
+        let text = self.filter_text.clone();
+        self.with_page(|p, cx| p.set_filter(&text, cx));
+        self.dirty = true;
     }
 
     pub fn on_enriched(&mut self) {
@@ -247,6 +306,11 @@ impl Core {
                 self.with_page(|p, cx| p.event(&ev, cx));
             }
             Ev::Move { x, y } => {
+                let tip_before = self.tip_at();
+                self.mouse = (!self.page_captured).then_some((x, y));
+                if self.tip_at() != tip_before {
+                    self.dirty = true;
+                }
                 let hover = if self.page_captured { Hover::None } else { self.hover_at(x, y) };
                 if hover != self.hover {
                     self.hover = hover;
@@ -255,40 +319,43 @@ impl Core {
                 self.with_page(|p, cx| p.event(&ev, cx));
             }
             Ev::Leave => {
+                self.mouse = None;
                 self.hover = Hover::None;
                 self.dirty = true;
                 self.with_page(|p, cx| p.event(&ev, cx));
             }
-            Ev::Down { x, y, right } => match self.hover_at(x, y) {
-                Hover::Menu if !right => {
-                    self.settings.sidebar_expanded = !self.settings.sidebar_expanded;
+            Ev::Down { x, y, right } => {
+                // A press hides the tooltip until the mouse moves again.
+                if self.mouse.take().is_some() {
                     self.dirty = true;
                 }
-                Hover::Nav(i) if !right => {
-                    if i != self.active {
-                        self.with_page(|p, cx| p.event(&Ev::Leave, cx));
-                        self.active = i;
-                        let text = self.filter_text.clone();
-                        self.with_page(|p, cx| p.set_filter(&text, cx));
+                let hit = self.hover_at(x, y);
+                match hit {
+                    Hover::Menu if !right => {
+                        self.settings.sidebar_expanded = !self.settings.sidebar_expanded;
                         self.dirty = true;
                     }
-                }
-                Hover::Clear => clear_filter = true,
-                Hover::Search => self.cmds.push(Cmd::FocusFilter),
-                _ => {
-                    if self.content_rect().contains(x, y) {
-                        self.page_captured = true;
-                        self.with_page(|p, cx| p.event(&ev, cx));
+                    Hover::Nav(i) if !right => self.navigate(i),
+                    Hover::Clear => clear_filter = true,
+                    Hover::Search => self.cmds.push(Cmd::FocusFilter),
+                    _ => {
+                        if self.content_rect().contains(x, y) {
+                            self.page_captured = true;
+                            self.with_page(|p, cx| p.event(&ev, cx));
+                        }
                     }
                 }
-            },
+            }
             Ev::Up { .. } => {
                 if std::mem::take(&mut self.page_captured) {
                     self.with_page(|p, cx| p.event(&ev, cx));
                 }
             }
-            Ev::Wheel { .. } | Ev::Key { .. } => self.with_page(|p, cx| p.event(&ev, cx)),
+            Ev::Wheel { .. } | Ev::Pan { .. } | Ev::Fling { .. } | Ev::Key { .. } | Ev::Char { .. } => {
+                self.with_page(|p, cx| p.event(&ev, cx))
+            }
         }
+        self.refresh_demand();
         clear_filter
     }
 
@@ -309,6 +376,7 @@ impl Core {
         let t = THEME;
         let (w, h) = (self.canvas.w, self.canvas.h);
         self.canvas.reset_clip();
+        self.canvas.clear_tips();
         self.canvas.fill(rect(0, 0, w, h), t.window);
         self.paint_title();
         let content = self.content_rect();
@@ -335,9 +403,12 @@ impl Core {
         c.round(tile_rect, c.px(5) as f32, t.accent, 255);
         c.text(&glyph(icons::CHART), Font::IconSmall, tile_rect, t.on_accent, Align::Center);
         let x = tile_rect.r() + c.px(26);
-        c.text("Light Task Manager", Font::Small, rect(x, 0, c.px(160), title_h), t.text_dim, Align::Left);
+        // The title is left out when the window is too narrow for it beside the search box.
+        if c.w >= c.px(TITLE_MIN_W) {
+            c.text(crate::system::actions::app_title(), Font::Small, rect(x, 0, c.px(240), title_h), t.text_dim, Align::Left);
+        }
 
-        if self.wants_filter() {
+        if self.wants_filter() && self.search_rect().w > 0 {
             let s = self.search_rect();
             let (focused, hovered) = (self.filter_focused, self.hover == Hover::Search);
             let c = &mut self.canvas;
@@ -353,6 +424,7 @@ impl Core {
                     c.round(clear.inset(c.px(4), c.px(4)), c.px(4) as f32, t.hover, 255);
                 }
                 c.text(&glyph(icons::CLEAR), Font::IconSmall, clear, t.text_dim, Align::Center);
+                c.tip(clear, tr().app.clear_search);
             }
         }
 
@@ -403,6 +475,8 @@ impl Core {
             c.round(menu, radius, t.hover, 255);
         }
         c.text(&glyph(icons::MENU), Font::Icon, menu, t.text, Align::Center);
+        let menu_tip = if self.settings.sidebar_expanded { tr().app.collapse_menu } else { tr().app.expand_menu };
+        c.tip(menu, menu_tip);
 
         let icon_w = c.px(40);
         for (i, r) in nav.iter().enumerate() {
@@ -423,7 +497,39 @@ impl Core {
         c.reset_clip();
     }
 
+    /// The tooltip under the mouse: the last area painted there with one.
+    fn tip_at(&self) -> Option<usize> {
+        let (x, y) = self.mouse?;
+        if self.touch {
+            return None;
+        }
+        self.canvas.tips.iter().rposition(|(r, _)| r.contains(x, y))
+    }
+
+    /// A tooltip below an area (above it when there is no room), kept inside the window.
+    fn paint_tip_below(&mut self, anchor: Rect, text: &str) {
+        let t = THEME;
+        let c = &mut self.canvas;
+        let w = c.measure(text, Font::Small) + c.px(20);
+        let h = c.px(28);
+        let gap = c.px(6);
+        let x = (anchor.x + (anchor.w - w) / 2).min(c.w - w - c.px(4)).max(c.px(4));
+        let mut y = anchor.b() + gap;
+        if y + h > c.h - c.px(4) {
+            y = anchor.y - gap - h;
+        }
+        let r = rect(x, y, w, h);
+        c.round(r, c.px(5) as f32, t.popup, 255);
+        c.stroke(r, c.px(5) as f32, 1.0, t.border, 255);
+        c.text(text, Font::Small, r, t.text, Align::Center);
+    }
+
     fn paint_tooltip(&mut self) {
+        if let Some(i) = self.tip_at() {
+            let (anchor, text) = self.canvas.tips[i].clone();
+            self.paint_tip_below(anchor, &text);
+            return;
+        }
         let Hover::Nav(i) = self.hover else { return };
         if self.settings.sidebar_expanded || self.sidebar != 0.0 {
             return;

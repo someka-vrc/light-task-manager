@@ -1,13 +1,18 @@
 //! Page abstraction. To add a page, implement `Page` and list it in `all()`.
 
 pub mod details;
+pub mod history;
 pub mod performance;
+pub mod services;
 pub mod settings;
+pub mod startup;
+pub mod timemachine;
+pub mod users;
 
-use crate::gfx::{Canvas, Rect};
-use crate::model::Snapshot;
-use crate::sampler::Shared;
 use crate::settings::Settings;
+use crate::system::model::Snapshot;
+use crate::system::sampler::Shared;
+use crate::ui::gfx::{Canvas, Rect};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug)]
@@ -16,9 +21,15 @@ pub enum Ev {
     Leave,
     Down { x: i32, y: i32, right: bool },
     Up { x: i32 },
-    /// In wheel notches, positive is away from the user.
-    Wheel { dx: f32, dy: f32 },
+    /// In wheel notches, positive is away from the user. `ctrl` is held for zooming.
+    Wheel { dx: f32, dy: f32, ctrl: bool },
+    /// A finger or pen dragged the content, in pixels.
+    Pan { dx: f32, dy: f32 },
+    /// The contact lifted while moving, in pixels per second. Zero stops a fling.
+    Fling { vx: f32, vy: f32 },
     Key { vk: u16, ctrl: bool },
+    /// A typed character, sent only while the page `captures_text`.
+    Char { ch: char },
     Tick { dt: f32 },
 }
 
@@ -26,13 +37,38 @@ pub enum Cmd {
     Toast(String),
     FocusFilter,
     Elevate,
+    /// `Settings::language` changed: switch to it, with its fonts.
+    Language,
+    /// Switch to the details page filtered to this PID.
+    ShowProcess(u32),
+    /// Start aim mode: the next click on any window picks its process.
+    Aim,
+    /// Ask where to save a file, then write it. Done by the window once the event is over,
+    /// since the file dialog runs its own message loop.
+    Save(SaveRequest),
 }
+
+pub struct SaveRequest {
+    /// The suggested file name, with its extension.
+    pub name: String,
+    /// The file type for the dialog's filter, like "CSV".
+    pub kind: &'static str,
+    /// The extension without the dot.
+    pub ext: &'static str,
+    /// Writes the content once a file is chosen.
+    pub write: Box<WriteFn>,
+}
+
+/// Writes a file's content.
+pub type WriteFn = dyn FnOnce(&mut dyn std::io::Write) -> std::io::Result<()>;
 
 pub struct Cx<'a> {
     pub settings: &'a mut Settings,
     pub shared: &'a Shared,
     pub cmds: &'a mut Vec<Cmd>,
     pub dirty: &'a mut bool,
+    /// The latest input came from a finger, so hit areas should be generous.
+    pub touch: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -56,43 +92,44 @@ pub trait Page {
     fn wants_filter(&self) -> bool {
         false
     }
+    /// What this page needs the sampler to read; see `crate::system::demand`.
+    fn demand(&self, _settings: &Settings) -> crate::system::demand::Needs {
+        crate::system::demand::Needs::default()
+    }
+    /// Typed characters go to the page (as `Ev::Char`) instead of the search box.
+    fn captures_text(&self) -> bool {
+        false
+    }
     fn set_filter(&mut self, _text: &str, _cx: &mut Cx) {}
     fn on_snapshot(&mut self, _snap: &Arc<Snapshot>, _cx: &mut Cx) {}
     fn on_enriched(&mut self, _cx: &mut Cx) {}
+    /// Called when the page becomes the active page.
+    fn on_show(&mut self, _cx: &mut Cx) {}
+    /// Called when another page becomes active.
+    fn on_hide(&mut self, _cx: &mut Cx) {}
+    /// Called once when the window closes, before settings are saved.
+    fn on_exit(&mut self) {}
     fn animating(&self) -> bool {
         false
     }
     fn cursor(&self) -> Cursor {
         Cursor::Arrow
     }
+    /// Whether dragging a finger or pen at (x, y) should scroll the content.
+    fn pannable(&self, _x: i32, _y: i32) -> bool {
+        false
+    }
 }
 
 pub fn all() -> Vec<Box<dyn Page>> {
     vec![
         Box::new(details::DetailsPage::new()),
-        Box::new(performance::PerformancePage),
+        Box::new(performance::PerformancePage::new()),
+        Box::new(timemachine::TimeMachinePage::new()),
+        Box::new(history::HistoryPage::new()),
+        Box::new(startup::StartupPage::new()),
+        Box::new(users::UsersPage::new()),
+        Box::new(services::ServicesPage::new()),
         Box::new(settings::SettingsPage::new()),
     ]
-}
-
-pub mod icons {
-    pub const MENU: char = '\u{E700}';
-    pub const SEARCH: char = '\u{E721}';
-    pub const CLOSE: char = '\u{E8BB}';
-    pub const MINIMIZE: char = '\u{E921}';
-    pub const MAXIMIZE: char = '\u{E922}';
-    pub const RESTORE: char = '\u{E923}';
-    pub const LIST: char = '\u{E8FD}';
-    pub const CHART: char = '\u{E9D9}';
-    pub const SETTINGS: char = '\u{E713}';
-    pub const CHEVRON_UP: char = '\u{E70E}';
-    pub const CHEVRON_DOWN: char = '\u{E70D}';
-    pub const CHECK: char = '\u{E73E}';
-    pub const BLOCK: char = '\u{E8D8}';
-    pub const COLUMNS: char = '\u{E9D5}';
-    pub const CLEAR: char = '\u{E711}';
-}
-
-pub fn glyph(ch: char) -> String {
-    ch.to_string()
 }

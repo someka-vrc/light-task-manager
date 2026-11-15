@@ -1,22 +1,18 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
-mod actions;
-mod columns;
-mod core;
+mod app;
 mod devtools;
-mod gfx;
-mod model;
+mod i18n;
 mod pages;
-mod sampler;
 mod settings;
-mod theme;
-mod window;
+mod system;
+mod ui;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("--bench") => devtools::bench(args.get(1).map_or("bench.txt", String::as_str)),
         Some("--shot") => devtools::shot(&args[1..]),
-        _ => window::run(),
+        _ => app::run(),
     }
 }
