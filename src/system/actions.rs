@@ -95,15 +95,16 @@ pub fn is_elevated() -> bool {
     }
 }
 
-/// Returns true if the elevated copy was started.
-pub fn relaunch_elevated() -> bool {
+/// Returns true if the elevated copy was started. `replacing`: this copy is running and
+/// about to close, so the new one waits for it (see `app::instance`).
+pub fn relaunch_elevated(replacing: bool) -> bool {
     let Ok(exe) = std::env::current_exe() else {
         return false;
     };
     let (verb, file) = (wide("runas"), wide(&exe.to_string_lossy()));
-    let result = unsafe {
-        ShellExecuteW(null_mut(), verb.as_ptr(), file.as_ptr(), null(), null(), SW_SHOWNORMAL)
-    };
+    let args = wide(crate::app::instance::AFTER_ELEVATE);
+    let args = if replacing { args.as_ptr() } else { null() };
+    let result = unsafe { ShellExecuteW(null_mut(), verb.as_ptr(), file.as_ptr(), args, null(), SW_SHOWNORMAL) };
     result as isize > 32
 }
 

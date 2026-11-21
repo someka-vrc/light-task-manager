@@ -3,7 +3,7 @@
 
 use super::*;
 
-fn haystack(p: &Proc) -> String {
+pub(super) fn haystack(p: &Proc) -> String {
     format!(
         "{}\u{1}{}\u{1}{}\u{1}{}",
         p.stat.name,
@@ -23,6 +23,9 @@ impl DetailsPage {
         } else {
             (Vec::new(), Vec::new())
         };
+        if let Some(data) = &mut self.range {
+            data.group(&self.groups);
+        }
         self.build_tree();
         // A selected process must stay visible when it joins a collapsed group or branch.
         if let Some(i) = self.selected_index_in_snap() {
@@ -88,27 +91,47 @@ impl DetailsPage {
 
     pub(super) fn resort(&mut self, settings: &Settings) {
         let procs = &self.snap.procs;
-        let (col, desc) = (settings.sort, settings.descending);
-        let compare = |a: &Proc, b: &Proc| {
-            let order = columns::compare(col, a, b);
-            let order = if desc { order.reverse() } else { order };
-            order.then(a.pid.cmp(&b.pid))
+        let range = self.range.as_ref();
+        // The process table sorts on a column of its processes; the range table on a
+        // value of its rows, or on the name or PID of their processes.
+        let (by, desc) = match range {
+            Some(_) => match settings.range_sort.item {
+                RItem::Name => (AnyCol::P(Col::Name), settings.range_desc),
+                RItem::Pid => (AnyCol::P(Col::Pid), settings.range_desc),
+                _ => (AnyCol::R(settings.range_sort), settings.range_desc),
+            },
+            None => (AnyCol::P(settings.sort), settings.descending),
         };
+        // Each side: the row's process (or a group's totals) and which row it is.
+        let compare = |pa: &Proc, a: Which, pb: &Proc, b: Which| {
+            let order = match (by, range) {
+                (AnyCol::R(col), Some(data)) => data.key(a, col).total_cmp(&data.key(b, col)),
+                (AnyCol::P(col), _) => columns::compare(col, pa, pb),
+                _ => std::cmp::Ordering::Equal,
+            };
+            let order = if desc { order.reverse() } else { order };
+            order.then(pa.pid.cmp(&pb.pid))
+        };
+        let by_proc = |a: &u32, b: &u32| compare(&procs[*a as usize], Which::Proc(*a), &procs[*b as usize], Which::Proc(*b));
         self.sorted.clear();
         self.sorted.extend(0..procs.len() as u32);
-        self.sorted.sort_unstable_by(|a, b| compare(&procs[*a as usize], &procs[*b as usize]));
+        self.sorted.sort_unstable_by(by_proc);
         for g in &mut self.groups {
-            g.members.sort_unstable_by(|a, b| compare(&procs[*a as usize], &procs[*b as usize]));
+            g.members.sort_unstable_by(by_proc);
         }
         // The tree sorts only among siblings.
-        self.roots.sort_unstable_by(|a, b| compare(&procs[*a as usize], &procs[*b as usize]));
+        self.roots.sort_unstable_by(by_proc);
         for kids in &mut self.children {
-            kids.sort_unstable_by(|a, b| compare(&procs[*a as usize], &procs[*b as usize]));
+            kids.sort_unstable_by(by_proc);
         }
 
         let groups = &self.groups;
         let mut order: Vec<u32> = (0..groups.len() as u32).collect();
-        order.sort_unstable_by(|a, b| compare(&groups[*a as usize].summary, &groups[*b as usize].summary));
+        let group = |g: u32| (&groups[g as usize].summary, Which::Group(g));
+        order.sort_unstable_by(|a, b| {
+            let ((pa, wa), (pb, wb)) = (group(*a), group(*b));
+            compare(pa, wa, pb, wb)
+        });
         let in_group = &self.in_group;
         let mut singles = self
             .sorted
@@ -120,7 +143,10 @@ impl DetailsPage {
         self.top.clear();
         loop {
             let group_first = match (singles.peek(), order.peek()) {
-                (Some(s), Some(g)) => compare(&groups[*g as usize].summary, &procs[*s as usize]).is_lt(),
+                (Some(s), Some(g)) => {
+                    let (pg, wg) = group(*g);
+                    compare(pg, wg, &procs[*s as usize], Which::Proc(*s)).is_lt()
+                }
                 (None, Some(_)) => true,
                 (Some(_), None) => false,
                 (None, None) => break,
@@ -212,6 +238,108 @@ impl DetailsPage {
             self.meta.insert(at, Meta { depth: ghost.depth, ..flat });
         }
         self.clamp_scroll();
+    }
+
+    /// The row of the range table a row of the view is.
+    pub(super) fn which(row: Row) -> Option<Which> {
+        match row {
+            Row::Proc(i) | Row::Child(i) | Row::Node(i) => Some(Which::Proc(i)),
+            Row::Group(g) => Some(Which::Group(g)),
+            Row::Ghost(_) => None,
+        }
+    }
+
+    /// Appends the text of a cell. `members` is the size of the group the row totals.
+    pub(super) fn cell_text(&self, col: AnyCol, row: Row, members: Option<usize>, out: &mut String) {
+        match col {
+            AnyCol::P(c) => fill_cell(c, self.row_proc(row), members, &self.scale, out),
+            AnyCol::R(c) => {
+                let p = self.row_proc(row);
+                match c.item {
+                    RItem::Name => fill_cell(Col::Name, p, members, &self.scale, out),
+                    RItem::Pid => fill_cell(Col::Pid, p, members, &self.scale, out),
+                    RItem::Time => {
+                        let (Some(data), Some(w)) = (&self.range, Self::which(row)) else { return };
+                        let l = data.life(w);
+                        match (l.born, l.died) {
+                            (true, true) => {
+                                let _ = write!(out, "{}〜{}", self.tl.clock(l.born_at), self.tl.clock(l.died_at));
+                            }
+                            (true, false) => out.push_str(&self.tl.clock(l.born_at)),
+                            (false, true) => out.push_str(&self.tl.clock(l.died_at)),
+                            (false, false) => {}
+                        }
+                    }
+                    _ => {
+                        if let (Some(data), Some(w)) = (&self.range, Self::which(row)) {
+                            out.push_str(&data.text(w, c));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The table as shown, for a file: every process the filter lets through, in the
+    /// table's order, with the shown columns in plain units.
+    pub(super) fn table_dump(&self, s: &Settings) -> timeline::export::Table {
+        // Files never carry paths, command lines or user names.
+        let private = |c: &AnyCol| matches!(c, AnyCol::P(Col::Path | Col::CmdLine | Col::User));
+        let cols: Vec<(AnyCol, u16)> = self.shown_columns(s).into_iter().filter(|(c, _)| !private(c)).collect();
+        let head = cols.iter().map(|(c, _)| export_name(*c)).collect();
+        let hit = |i: u32| self.filter.is_empty() || {
+            let hay = haystack(&self.snap.procs[i as usize]);
+            self.filter.iter().all(|t| hay.contains(t.as_str()))
+        };
+        let rows = self
+            .sorted
+            .iter()
+            .copied()
+            .filter(|i| hit(*i))
+            .map(|i| cols.iter().map(|(c, _)| self.export_cell(*c, Which::Proc(i))).collect())
+            .collect();
+        timeline::export::Table { head, rows }
+    }
+
+    /// The whole record summed up as one range, for a file: heaviest first by the table's
+    /// sort column, the filter applied.
+    pub(super) fn whole_table(&self, samples: &[Arc<timeline::Sample>], s: &Settings) -> timeline::export::Table {
+        let items: Vec<RItem> = s.range_items.iter().map(|(i, _)| *i).collect();
+        let (data, procs) = RangeData::build(samples, &items, |r| self.tl.unpack(r));
+        let cols: Vec<RCol> = range::visible(&s.range_items, s.range_ops).into_iter().map(|(c, _)| c).collect();
+        let mut order: Vec<u32> = (0..procs.len() as u32)
+            .filter(|i| {
+                let hay = haystack(&procs[*i as usize]);
+                self.filter.iter().all(|t| hay.contains(t.as_str()))
+            })
+            .collect();
+        let sort = s.range_sort;
+        order.sort_by(|a, b| {
+            let (pa, pb) = (&procs[*a as usize], &procs[*b as usize]);
+            let o = match sort.item {
+                RItem::Name => columns::compare(Col::Name, pa, pb),
+                RItem::Pid => pa.pid.cmp(&pb.pid),
+                _ => data.key(Which::Proc(*a), sort).total_cmp(&data.key(Which::Proc(*b), sort)),
+            };
+            (if s.range_desc { o.reverse() } else { o }).then(pa.pid.cmp(&pb.pid))
+        });
+        let head = cols.iter().map(|c| export_name(AnyCol::R(*c))).collect();
+        let rows = order
+            .iter()
+            .map(|i| cols.iter().map(|c| data.export(&procs[*i as usize], *c, Which::Proc(*i), self.tl.offset)).collect())
+            .collect();
+        timeline::export::Table { head, rows }
+    }
+
+    /// A cell for a file: a plain number in base units, or text.
+    fn export_cell(&self, col: AnyCol, w: Which) -> String {
+        let Which::Proc(i) = w else { return String::new() };
+        let p = &self.snap.procs[i as usize];
+        match (col, &self.range) {
+            (AnyCol::P(c), _) => columns::export_value(c, p, &self.scale),
+            (AnyCol::R(c), Some(data)) => data.export(p, c, w, self.tl.offset),
+            (AnyCol::R(_), None) => String::new(),
+        }
     }
 
     pub(super) fn row_proc(&self, row: Row) -> &Proc {
@@ -388,8 +516,12 @@ impl DetailsPage {
         self.prev_at = Some(now);
     }
 
-    /// Takes a new update.
+    /// Takes a new update. While the table shows the past, only the latest is kept.
     pub(super) fn take_snapshot(&mut self, snap: &Arc<Snapshot>, settings: &Settings, now: Instant) {
+        self.live = snap.clone();
+        if self.past {
+            return;
+        }
         self.track_lifetime(snap, settings, now);
         self.snap = snap.clone();
         self.haystacks.clear();

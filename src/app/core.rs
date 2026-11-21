@@ -45,6 +45,8 @@ pub struct Core {
     pub pages: Vec<Box<dyn Page>>,
     pub active: usize,
     pub dirty: bool,
+    /// Whether a page showed a badge at the last snapshot.
+    badge: bool,
     pub cmds: Vec<Cmd>,
     pub maximized: bool,
     pub filter_focused: bool,
@@ -71,6 +73,7 @@ impl Core {
             pages: pages::all(),
             active: 0,
             dirty: true,
+            badge: false,
             cmds: Vec::new(),
             maximized: false,
             filter_focused: false,
@@ -244,6 +247,12 @@ impl Core {
         for page in &mut self.pages {
             page.on_snapshot(snap, &mut cx);
         }
+        // A badge can come and go with nothing else on the screen changing.
+        let badge = self.pages.iter().any(|p| p.badge());
+        if badge != self.badge {
+            self.badge = badge;
+            self.dirty = true;
+        }
     }
 
     pub fn navigate(&mut self, i: usize) {
@@ -372,6 +381,17 @@ impl Core {
         Some(unsafe { &mut *(page.as_mut() as *mut dyn Page as *mut crate::pages::details::DetailsPage) })
     }
 
+    /// Puts the process page back on the latest snapshot, as when its graph resumes.
+    pub fn details_go_live(&mut self) {
+        let settings = &self.settings;
+        if let Some(page) = self.pages.get_mut(0) {
+            // Page 0 is always the details page; see `pages::all`.
+            let page = unsafe { &mut *(page.as_mut() as *mut dyn Page as *mut crate::pages::details::DetailsPage) };
+            page.go_live(settings);
+        }
+        self.dirty = true;
+    }
+
     pub fn render(&mut self) {
         let t = THEME;
         let (w, h) = (self.canvas.w, self.canvas.h);
@@ -493,6 +513,13 @@ impl Core {
             c.text(&glyph(n.icon), Font::Icon, rect(r.x, r.y, icon_w, r.h), color, Align::Center);
             let label = rect(r.x + icon_w + c.px(4), r.y, c.px(150), r.h);
             c.text(n.label, Font::Body, label, t.text, Align::Left);
+            if self.pages[i].badge() {
+                // Over the icon's top right corner.
+                let d = c.px(14);
+                let b = rect(r.x + icon_w - c.px(14), r.y + c.px(5), d, d);
+                c.round(b, d as f32 / 2.0, t.warn, 255);
+                c.text("!", Font::Small, b, t.window, Align::Center);
+            }
         }
         c.reset_clip();
     }

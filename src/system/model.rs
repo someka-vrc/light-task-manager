@@ -110,8 +110,12 @@ pub struct Proc {
     pub disk_bps: u64,
     /// Busiest GPU engine of the process, in percent.
     pub gpu_util: f32,
-    /// Type of that engine, such as "3D".
+    /// The engine as shown: the adapter and its type, such as "GPU 0 - 3D".
     pub gpu_engine: String,
+    /// The adapter of that engine, as written in performance counter instance names.
+    pub gpu_luid: String,
+    /// Type of that engine, such as "3D".
+    pub gpu_kind: String,
     pub gpu_dedicated: u64,
     pub gpu_shared: u64,
     /// Network bytes (sent + received) per second; TCP only, needs administrator rights.
@@ -146,10 +150,14 @@ impl Proc {
 
 #[derive(Default)]
 pub struct Snapshot {
+    /// When the sampler took this sample, as a FILETIME (UTC). 0 for a sample that was not taken.
+    pub taken: i64,
     /// Empty when the sample is machine-wide only; see `has_procs`.
     pub procs: Vec<Proc>,
     /// Whether processes were sampled. Pages that use `procs` skip samples without them.
     pub has_procs: bool,
+    /// The per-process baselines were old, so this sample shows no per-process rates.
+    pub stale: bool,
     pub cpu_total: f32,
     pub mem_total: u64,
     pub mem_used: u64,

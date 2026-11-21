@@ -188,11 +188,11 @@ impl PerformancePage {
             v.sort();
             v
         };
-        for (i, id) in gpus.iter().enumerate() {
+        for id in gpus.iter() {
             let live = s.gpus.iter().find(|g| format!("gpu:{}", g.luid) == **id);
             out.push(Entry {
                 id: (*id).clone(),
-                title: format!("GPU {i}"),
+                title: format!("GPU {}", crate::system::sysinfo::gpu_number(id.strip_prefix("gpu:").unwrap_or(id))),
                 sub: live.map_or_else(String::new, |g| g.name.clone()),
                 value: live.map_or_else(|| "—".into(), |g| format!("{:.0}%", g.util)),
                 color: t.chart_gpu,

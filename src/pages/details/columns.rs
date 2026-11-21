@@ -555,6 +555,24 @@ fn percent(out: &mut String, part: f64, whole: f64) {
     let _ = write!(out, "{v:.1}%");
 }
 
+/// The value of a cell for a file: a plain number in base units (ratios from 0 to 1, bytes,
+/// bytes per second, seconds), or the text the table shows.
+pub fn export_value(col: Col, p: &Proc, scale: &Scale) -> String {
+    let ratio = |part: f64, whole: f64| if whole > 0.0 { format!("{}", part / whole) } else { String::new() };
+    match col {
+        Col::Cpu => format!("{}", p.cpu as f64 / 100.0),
+        Col::GpuUsage => format!("{}", p.gpu_util as f64 / 100.0),
+        Col::CpuTime => format!("{}", p.cpu_time as f64 / 1e7),
+        Col::MemActivePct => ratio(p.active_private as f64, scale.mem_total as f64),
+        Col::MemPrivatePct => ratio(p.private_ws as f64, scale.mem_total as f64),
+        Col::DiskPct => ratio(p.disk_bps as f64, scale.disk_full),
+        Col::NetPct => ratio(p.net_bps as f64, scale.net_full),
+        _ if is_text(col) => text(col, p).to_string(),
+        Col::Priority => p.base_priority.to_string(),
+        _ => number(col, p).to_string(),
+    }
+}
+
 /// Appends the cell text to `out`.
 pub fn cell(col: Col, p: &Proc, scale: &Scale, out: &mut String) {
     match col {

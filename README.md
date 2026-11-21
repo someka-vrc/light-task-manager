@@ -10,29 +10,27 @@ A lightweight task manager for Windows 11.
 
 ![Processes](docs/images/page1.png)
 
+![Processes](docs/images/page1-1.png)
+
 **Performance**
 
 ![Performance](docs/images/page2.png)
 
-**Time Machine**
-
-![Time Machine](docs/images/page3.png)
-
 **App history**
 
-![App history](docs/images/page4.png)
+![App history](docs/images/page3.png)
 
 **Startup apps**
 
-![Startup apps](docs/images/page5.png)
+![Startup apps](docs/images/page4.png)
 
 **Users**
 
-![Users](docs/images/page6.png)
+![Users](docs/images/page5.png)
 
 **Services**
 
-![Services](docs/images/page7.png)
+![Services](docs/images/page6.png)
 
 ## Usage
 
@@ -69,9 +67,8 @@ The UI is available in English, Japanese, Simplified Chinese and Korean. Choose 
 
 | Page | Contents and notes |
 | --- | --- |
-| **Processes** | A table of all processes (the standard Processes and Details tabs in one). Change the columns with "Select columns" on the toolbar or by right-clicking a header. See "Processes page" below. |
+| **Processes** | A table of all processes (the standard Processes and Details tabs in one). Change the columns with "Select columns" on the toolbar or by right-clicking a header. See "Processes page" below.<br>The graph at the top records the last few minutes; click it to list the processes at that time, or drag to sum up a range. See "The graph" below. |
 | **Performance** | Live graphs and figures for CPU (overall and per logical processor), memory, disks, network and GPUs.<br>For the graphs, system-wide values (GPUs included) keep being read while other pages are open or the window is minimized. |
-| **Time Machine** | Records CPU, memory and GPU use over the last few minutes, with each process's use at the time, to look back on later. See "Time Machine" below. |
 | **App history** | Total CPU time and I/O per executable.<br>Saved in `%APPDATA%\LightTaskManager\history.tsv`. |
 | **Startup apps** | Entries of the Run keys and the Startup folders. Enable or disable them. |
 | **Users** | Signed-in sessions with their resource use, and the processes of the selected user. Disconnect or sign out. |
@@ -110,53 +107,79 @@ Copies the selected row to the clipboard as text (one item per line). The copy f
 - **Unknown values:** Items that cannot be read, for example for lack of privileges, are written as `-`.
 - **Copying all columns:** With "All", items that need their column to be shown to be read, such as GPU and network, are `-` while hidden.
 
-### Time Machine
+### The graph (past moments and ranges)
 
-Records samples over a recent period (the retention period), at the same interval as the update speed. The page is for finding out afterwards what made the PC slow a moment ago.
+The graph at the top of the Processes page records samples over a recent period (the retention period, 1 minute by default) in memory, at the same interval as the update speed. It is for finding out afterwards what made the PC slow a moment ago.
 
 | Action | What it does |
 | --- | --- |
-| **Pick a time** | Click the graph to list the processes at that time. |
-| **Pick a range** | Drag on the graph to list the processes that existed during it. |
+| **On / off** | The graph button on the toolbar. Turning it off discards the record, after asking (choose "Don't ask me again" to skip the question from then on). |
+| **Settings** | Right-click the graph, or use the ∨ of the graph button, and choose "Graph settings". Change the items and the retention period. |
+| **Height** | Drag the border between the graph and the table. The height is saved. |
+| **Pick a time** | Click the graph: the table lists the processes at that time, with the same columns, view (flat / groups / tree), sorting and filter as usual. |
+| **Pick a range** | Drag on the graph: the table sums up that range (the range table). |
 | **Zoom** | Over the graph, hold `Ctrl` and scroll down to zoom in, up to zoom out. |
 | **Scroll sideways** | Only while zoomed in, scroll over the graph to move back and forth. |
-| **Back to live** | "Resume" on the toolbar, or `Esc`. |
-| **Scroll the table sideways** | When the columns do not fit: the scroll bar under the table, `Shift` + wheel, or a horizontal drag (touch). |
+| **Back to live** | "Resume" under the toolbar, or `Esc`. |
 
-- **Pause:** Picking a time or zooming in freezes the whole record at that moment. Recording goes on in the background while frozen.
-- **Range table:** For each item, shows start, end, change, average and maximum. For processes that started or ended within the range, those times are the start or end, and the average and maximum cover only the time they existed.
-  - The `+-` column marks processes that started (`+`, blue) or ended (`-`, red) within the range.
+- **Pause:** Picking a time or zooming in freezes the whole record at that moment. Recording goes on in the background while frozen. Export and Resume appear under the toolbar.
+- **Acting on the past:** Only processes still running with the same PID and creation time can be ended.
+- **Range table:** Its columns are items × statistics. Items (CPU, memory, I/O and so on) and statistics (start, end, change, average, minimum, maximum) are chosen separately in "Select columns": turning "Max" off drops the maximum of every item. Right-click a column header to hide its item, or its statistic for every item.
+  - CPU time, I/O bytes and counts, page faults and cycles only grow, so they have one column: how much they grew within the range ("In range").
+  - For processes that started or ended within the range, those times are the start or end, and the average, minimum and maximum cover only the time they existed.
+  - In the groups view, a group's row sums its members at each sample before summing up: a group's maximum is the heaviest moment of the whole group.
+  - The `+-` column marks processes that started (`+`, green) or ended (`-`, red) within the range.
   - The "Time" column shows when they started (the process creation time) or ended. The end time is that of the first sample without the process, so it depends on the update interval.
-- **Settings:** "Settings" on the toolbar changes the items to record and the retention period. It also shows an estimate of the memory used.
-- **Items:** CPU and memory by default. Values are recorded whatever the items are, so turning one on later still shows the past (GPU and GPU memory are recorded only while either is on).
+  - System Idle Process (the processors' free time) is left out.
+- **Items:** The lines of the graph. CPU and memory by default. Values are recorded whatever the items are, so turning one on later still shows the past (GPU and GPU memory are recorded only while either is on).
 
-  | Item | Graph (0–100%) | Table (per process) |
-  | --- | --- | --- |
-  | CPU | Utilization | Utilization (%) |
-  | CPU breakdown | Share of kernel time (the tooltip also shows the speed) | — |
-  | Memory | Utilization | Active private working set (MB) |
-  | Committed memory | Committed / limit | Private bytes (MB); useful for finding leaks |
-  | Disk | Active time of the busiest disk (the tooltip shows each disk) | Read and write rate (MB/s) |
-  | GPU | Utilization per GPU | Utilization (%) |
-  | GPU memory | Dedicated memory used / total per GPU | Dedicated GPU memory (MB) |
-  | Handles | No line (the tooltip shows the total) | Handle count |
-  | Page faults | No line (the tooltip shows the total) | Per second |
-  | Not responding | No line (the tooltip shows the count) | The status at a time; for a range, the seconds it was not responding |
+  | Item | Graph (0–100%) |
+  | --- | --- |
+  | CPU | Utilization |
+  | CPU breakdown | Share of kernel time (the tooltip also shows the speed) |
+  | Memory | Utilization |
+  | Committed memory | Committed / limit |
+  | Disk | Active time of the busiest disk (the tooltip shows each disk) |
+  | GPU | Utilization per GPU |
+  | GPU memory | Dedicated memory used / total per GPU |
 
+- **What is recorded:** The values of every column of the table. GPU, network, power throttling and user / GDI objects are read only while their column (or, for the range table, their item) is shown, so they are 0 while it was not.
+- **Memory:** What never changes about a process is kept once per process, and the values are packed into small integers (about 140 bytes per process and sample): 300 processes every second take about 2.5 MB a minute. The settings dialog shows the memory in use now and an estimate for the retention period.
 - **GPU numbers:** The same numbers as on the Performance page. The first three GPUs have their own colors; the fourth and later share one. GPUs with no values in the retention period are not shown.
-- **Export:** While a time or range is picked, "Export" on the toolbar writes the selection to a file.
-  - Range: the selection (or the selected time) or everything (the whole record at the time it was frozen). The table for everything is summed over the whole record, sorted by the maximum of the first item, highest first.
-  - Content: Table (the table as shown, one row per process), Per process (each process's values in every sample) or System (system-wide values in every sample). The search filter applies to Table and Per process.
+- **Export:** While a time or range is picked, "Export" under the toolbar writes the selection to a file.
+  - Range: the selection (or the selected time) or everything (the whole record at the time it was frozen). The table for everything is summed over the whole record, in the order the range table is sorted.
+  - Content: Table (the table as shown, one row per process, the shown columns), Per process (each process's values in every sample) or System (system-wide values in every sample). The search filter applies to Table and Per process.
   - Format CSV / TSV; encoding UTF-8 with BOM / Shift_JIS (characters it cannot represent become `?`). The dialog shows an estimated file size.
   - Headers are English snake_case with the unit at the end (`_bytes`, `_ratio` (0–1), `_seconds`, `_per_second`, `_hz`). Times are ISO 8601 with the UTC offset.
-  - Executable paths, command lines and user names are not written. Only the items that are on are written.
+  - Executable paths, command lines and user names are not written.
   - The suggested file name is `performance-{date}-{time}-{table|process|system}.{csv|tsv}`, with the start of the range as the date and time.
 - **Right after starting:** Values from about the first 2 seconds are not recorded, since they are mostly the load of this app starting up (reading executables' icons and descriptions).
-- **Load:** While on, per-process values keep being read even when the window is minimized (when off, only system-wide values are read while minimized). Recording GPUs also keeps reading the per-process GPU counters. To reduce the load, turn it off with the switch on the toolbar. Turning it off discards the record.
+- **Load:** While on, per-process values keep being read even when the window is minimized (when off, only system-wide values are read while minimized). Recording GPUs also keeps reading the per-process GPU counters. To reduce the load, turn it off with the graph button.
+
+### Recording to a database
+
+Turn it on under "Recording to a database" in Settings (off by default). While on, the system-wide and per-process values are written to a SQLite file every few seconds, so that other programs can query them while the app runs, and the last seconds before a crash are kept. There is no page for it; the Settings page is all there is.
+
+- **Where:** `%LOCALAPPDATA%\LightTaskManager\history\history-v1-YYYYMMDD.db` by default, one file per day (local date). The `v1` is the version of the tables: when they change, new files get a new version in the name (and the same day can have files of two versions). You can change the folder in Settings (Browse / Open / Reset to default). Files in the old folder are never moved or deleted, and only files named like this are ever deleted. Do not put the folder on a network drive (WAL does not work there). SQLite in WAL mode, written with `synchronous=FULL`, through the `winsqlite3.dll` that comes with Windows 10 and later.
+- **Settings:** changes apply after the app is restarted. Interval 1 / 5 / 10 / 30 / 60 seconds (independent of the update speed); days kept: any whole number from 1 (files older than that are deleted automatically, but never the newest); process details (path, command line, user name) and GPU use are off by default. At 5 seconds, a PC with about 440 processes writes roughly 600 MB a day.
+- **Tables:** `sample` (system-wide values), `process` and `process_sample` (one row per sample and process, with cumulative `cpu_time_seconds`, `io_read_bytes`, `io_write_bytes` and `page_faults` besides the rates, and the working set, private bytes, pools, threads, user/GDI objects, cycles and I/O counts; the GPU ones add the shared GPU memory and the busiest engine), `device` and `device_sample` (disks and GPUs), and `session`. Times are Unix milliseconds (UTC) in `ts`. Names and units follow the graph's export.
+- **Crashes:** each run of the app is a session. A session that did not end properly is marked `end_reason = 'abnormal'` at the next start, and its `ended_at` is the time of the last sample.
+- **Reading it:** while the app is writing, any program can read the file (the `sqlite3` command, DuckDB, Python...).
+
+  ```sql
+  INSTALL sqlite; LOAD sqlite;
+  ATTACH 'history-20261117.db' AS d (TYPE sqlite, READ_ONLY);
+  SELECT to_timestamp(ps.ts / 1000.0) AS time, p.name, ps.cpu_ratio
+  FROM d.process_sample ps JOIN d.process p USING (pid, create_time)
+  ORDER BY ps.cpu_ratio DESC LIMIT 10;
+  ```
+
+  Use `to_timestamp` rather than `epoch_ms` in DuckDB, which shows UTC without a time zone. To read several days, attach each file. Keep queries short: a transaction that stays open keeps the `-wal` file from shrinking.
+- **One copy:** only one copy of the app runs at a time. Starting it again brings the running window forward.
 
 ### Where settings are saved
 
-The window size, columns, sort order, update speed, copy settings, time machine settings, language and so on are saved automatically to:
+The window size, columns, sort order, update speed, copy settings, graph settings, language and so on are saved automatically to:
 
 `%APPDATA%\LightTaskManager\settings.ini`
 
@@ -194,6 +217,7 @@ cargo test
 | `src/app/core.rs` | Title bar, sidebar and switching pages |
 | `src/app/aim.rs` | Aiming mode (a transparent window over the whole screen takes the click and finds the process of the window under it) |
 | `src/app/pointer.rs` | Touch and pen gestures |
+| `src/app/instance.rs` | Allowing one running copy (a named mutex; the copy started by "restart as administrator" waits for the old one) |
 | **`src/i18n/`** | **Languages of the UI** |
 | `src/i18n/mod.rs` | The languages, the current language (`tr()`), and fonts per language |
 | `src/i18n/strings.rs` | The text of the UI, grouped by page |
@@ -205,6 +229,8 @@ cargo test
 | `src/system/demand.rs` | What the sampler needs to read. Each page states its needs with `Page::demand`, "only while shown" and "always", and only their union is read |
 | `src/system/actions.rs` | Acting on processes and the shell (ending, opening the location and so on) |
 | `src/system/win.rs` | Small conversions around Win32 calls (UTF-16 strings, FILETIME, COLORREF) |
+| `src/system/recorder.rs` | Recording to the database: writes the samples to a SQLite file per day, ends sessions, cleans up old files |
+| `src/system/sqlite.rs` | A minimal SQLite binding that loads Windows' `winsqlite3.dll` when first needed |
 | **`src/ui/`** | **Drawing and the parts shared by pages** |
 | `src/ui/gfx.rs` | CPU drawing (filling a DIB and drawing text with GDI) |
 | `src/ui/theme.rs` | Colors |
@@ -213,8 +239,9 @@ cargo test
 | `src/ui/widgets.rs` | The table, menu, confirmation dialog and toolbar shared by the list pages |
 | `src/ui/copyfmt.rs` | Copy formats of a row |
 | **`src/pages/`** | **The pages** (the `Page` trait is in `mod.rs`) |
-| `src/pages/details/` | The Processes page. `rows.rs` (groups, tree, sorting, filtering), `input.rs` (input and menus), `paint.rs` (drawing), `columns.rs` (column definitions, formatting, comparison), `grouping.rs` (grouping processes) |
-| `src/pages/timemachine/` | Time Machine. `target.rs` (items), `table.rs` (table), `input.rs` (input), `paint.rs` (drawing), `export.rs` (export) |
+| `src/pages/details/` | The Processes page. `rows.rs` (groups, tree, sorting, filtering), `input.rs` (input and menus), `paint.rs` (drawing), `columns.rs` (column definitions, formatting, comparison), `grouping.rs` (grouping processes), `range.rs` (the range table's items, statistics and sums) |
+| `src/pages/details/timeline/` | The graph of the Processes page. `mod.rs` (the record, how it is kept, input), `graph.rs` (drawing), `dialog.rs` (settings and turning off), `target.rs` (items), `export.rs` (export) |
+| `src/pages/licenses.rs` | The open source licenses shown from the Settings page (`LICENSE` and `THIRD-PARTY-NOTICES.txt`, built into the executable) |
 
 ### Adding a page
 
@@ -269,7 +296,11 @@ The language picker on the Settings page is made from `Lang::ALL`, so the page n
 
 `--bench` measures drawing, scrolling, filtering and sorting with 5,000 rows.
 `--shot` writes the given page (counting from 0) to a BMP without opening a window. `expand` after the page expands all groups (tree). `view=flat|group|tree` picks the Processes page's view. `lifetime` hands one more update in which two processes near the top end and one starts (for checking the start and end highlighting). `lang=en|ja|zh-Hans|ko` picks the language (by default it follows Windows, as the app does).
-A number after the page takes that many more samples before writing (for checking the graphs of the Performance page and Time Machine).
-`size=width,height` sets the window size (default 1240,760). `tm_gpu` records GPUs in Time Machine (or name the items directly with `tm=cpu,disk,...`), and `tm_off` turns Time Machine off. `from_start` hands the pages every sample from the first one (for checking right after starting). `verbose` prints the content of each sample. `minimized` takes the samples as if minimized, and `restore` also takes the sample right after restoring. It prints the number of samples received, the content of the last sample and the needs being read.
-`click=x,y`, `drag=x1,y1,x2,y2`, `move=x,y`, `zoom=x,y,notches` (`Ctrl` + wheel), `wheel=x,y,dx,dy`, `key=virtual key code`, `type=text` and `filter=search text` replay that input before writing.
+A number after the page takes that many more samples before writing (for checking the graphs of the Performance and Processes pages).
+`size=width,height` sets the window size (default 1240,760). `tm_gpu` records GPUs in the graph (or name the items directly with `tm=cpu,disk,...`), and `tm_off` turns the graph off. `from_start` hands the pages every sample from the first one (for checking right after starting). `verbose` prints the content of each sample. `minimized` takes the samples as if minimized, and `restore` also takes the sample right after restoring. It prints the number of samples received, the content of the last sample and the needs being read.
+`click=x,y`, `rclick=x,y`, `drag=x1,y1,x2,y2`, `move=x,y`, `zoom=x,y,notches` (`Ctrl` + wheel), `wheel=x,y,dx,dy`, `key=virtual key code`, `type=text` and `filter=search text` replay that input before writing.
 `--shot` uses the default columns, so the column settings are not applied.
+
+## License
+
+[MIT License](LICENSE). The licenses of the third-party code built into the executable are in [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt), and in the app under "Open source licenses" at the bottom of the Settings page. When `Cargo.lock` gains a dependency that ends up in the executable, add its notice to THIRD-PARTY-NOTICES.txt.

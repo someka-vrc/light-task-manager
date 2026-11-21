@@ -262,11 +262,15 @@ fn conn_total_v6(row: &MIB_TCP6ROW) -> Option<u64> {
     read_rod(&mut rod, ret == 0)
 }
 
-/// One process's GPU use, summed over adapters.
+/// One process's GPU use: the busiest engine, and memory summed over adapters.
 #[derive(Default, Clone)]
 pub struct ProcGpu {
     pub util: f32,
-    pub engine: String,
+    /// The adapter and engine type of the busiest engine: its LUID, its type such as "3D", and
+    /// a label like "GPU 0 - 3D" (the adapter numbered by LUID).
+    pub luid: String,
+    pub kind: String,
+    pub label: String,
     pub dedicated: u64,
     pub shared: u64,
 }
@@ -450,19 +454,31 @@ impl SysSampler {
         // Instance names look like "pid_1234_luid_..._eng_0_engtype_3D".
         let pid_of = |name: &str| -> Option<u32> { name.strip_prefix("pid_")?.split('_').next()?.parse().ok() };
         let mut by_pid: HashMap<u32, ProcGpu> = HashMap::new();
-        // Per process and engine type, summed over engines and adapters.
-        let mut engines: HashMap<(u32, String), f64> = HashMap::new();
+        // Per process, adapter and engine type, summed over the engines of that type.
+        let mut engines: HashMap<(u32, String, String), f64> = HashMap::new();
         for (name, v) in g.pdh.array(g.engine) {
             let Some(pid) = pid_of(&name) else { continue };
+            let Some(luid) = luid_of(&name) else { continue };
             let kind = name.split("engtype_").nth(1).filter(|k| !k.is_empty()).unwrap_or(crate::i18n::tr().common.other).to_string();
-            *engines.entry((pid, kind)).or_insert(0.0) += v;
+            // Software adapters are not GPUs and get no number, as on the performance page.
+            if self.gpu_info.entry(luid.to_string()).or_insert_with(|| adapter_info(luid)).software {
+                continue;
+            }
+            register_gpu(luid);
+            *engines.entry((pid, luid.to_string(), kind)).or_insert(0.0) += v;
         }
-        for ((pid, kind), v) in engines {
+        for ((pid, luid, kind), v) in engines {
             let entry = by_pid.entry(pid).or_default();
             let v = v.clamp(0.0, 100.0) as f32;
             if v > entry.util {
                 entry.util = v;
-                entry.engine = kind;
+                entry.kind = kind;
+                entry.luid = luid;
+            }
+        }
+        for entry in by_pid.values_mut() {
+            if !entry.luid.is_empty() {
+                entry.label = format!("GPU {} - {}", gpu_number(&entry.luid), entry.kind);
             }
         }
         for (name, v) in g.pdh.array(g.dedicated) {
@@ -731,9 +747,31 @@ impl SysSampler {
         // Software adapters (the basic render driver, virtual display drivers) are not GPUs,
         // and Task Manager leaves them out too; so do adapters without engine counters.
         out.retain(|g| !g.engines.is_empty());
+        for g in &out {
+            register_gpu(&g.luid);
+        }
         out.sort_by(|a, b| a.luid.cmp(&b.luid));
         out
     }
+}
+
+/// The LUIDs of the GPUs (not software adapters) seen so far in this run.
+static GPU_LUIDS: std::sync::Mutex<std::collections::BTreeSet<String>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Notes a GPU. Only real adapters are passed in: those that `gpus` keeps.
+fn register_gpu(luid: &str) {
+    let mut set = GPU_LUIDS.lock().unwrap_or_else(|e| e.into_inner());
+    if !set.contains(luid) {
+        set.insert(luid.to_string());
+    }
+}
+
+/// The number of a GPU in "GPU 0", "GPU 1"... everywhere in the app: its rank by LUID among the
+/// GPUs seen in this run. An adapter that goes away keeps its number, so past samples still match.
+pub fn gpu_number(luid: &str) -> usize {
+    register_gpu(luid);
+    let set = GPU_LUIDS.lock().unwrap_or_else(|e| e.into_inner());
+    set.iter().position(|l| l == luid).unwrap_or(0)
 }
 
 fn engine_rank(kind: &str) -> u8 {

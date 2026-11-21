@@ -2,11 +2,11 @@
 
 pub mod details;
 pub mod history;
+mod licenses;
 pub mod performance;
 pub mod services;
 pub mod settings;
 pub mod startup;
-pub mod timemachine;
 pub mod users;
 
 use crate::settings::Settings;
@@ -37,6 +37,11 @@ pub enum Cmd {
     Toast(String),
     FocusFilter,
     Elevate,
+    /// Ask for the recording's folder (`Settings::rec_dir`) and take it. Done by the window, since the
+    /// folder dialog runs its own message loop.
+    PickRecDir,
+    /// Open the recording's folder in Explorer, making it first when it is not there yet.
+    OpenRecDir,
     /// `Settings::language` changed: switch to it, with its fonts.
     Language,
     /// Switch to the details page filtered to this PID.
@@ -75,6 +80,7 @@ pub struct Cx<'a> {
 pub enum Cursor {
     Arrow,
     SizeWE,
+    SizeNS,
     IBeam,
 }
 
@@ -112,6 +118,10 @@ pub trait Page {
     fn animating(&self) -> bool {
         false
     }
+    /// A "!" on the page's entry in the sidebar: something needs attention there.
+    fn badge(&self) -> bool {
+        false
+    }
     fn cursor(&self) -> Cursor {
         Cursor::Arrow
     }
@@ -125,7 +135,6 @@ pub fn all() -> Vec<Box<dyn Page>> {
     vec![
         Box::new(details::DetailsPage::new()),
         Box::new(performance::PerformancePage::new()),
-        Box::new(timemachine::TimeMachinePage::new()),
         Box::new(history::HistoryPage::new()),
         Box::new(startup::StartupPage::new()),
         Box::new(users::UsersPage::new()),

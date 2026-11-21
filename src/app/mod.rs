@@ -2,6 +2,7 @@
 
 pub mod aim;
 pub mod core;
+pub mod instance;
 pub mod pointer;
 pub mod window;
 

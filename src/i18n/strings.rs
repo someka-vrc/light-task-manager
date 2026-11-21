@@ -83,6 +83,7 @@ pub struct Units {
     pub seconds: fn(u64) -> String,
     pub minutes: fn(u64) -> String,
     pub min_sec: fn(u64, u64) -> String,
+    pub days: fn(u64) -> String,
     pub millis: fn(f64) -> String,
     pub mts: fn(u32) -> String,
     pub approx: fn(&str) -> String,
@@ -269,13 +270,9 @@ pub struct Perf {
     pub removable: &'static str,
 }
 
-/// The time machine page.
+/// The graph over the process table, and the tables of a past moment or a range.
 pub struct Tm {
-    pub title: &'static str,
     pub resume: &'static str,
-    pub show_details: &'static str,
-    pub off_title: &'static str,
-    pub off_note: &'static str,
     pub pick_point: &'static str,
     pub cpu_kernel: &'static str,
     pub disk_busiest: &'static str,
@@ -285,9 +282,6 @@ pub struct Tm {
     pub view_range: fn(&str) -> String,
     pub not_recording: &'static str,
     pub started: &'static str,
-    pub kernel: &'static str,
-    pub commit: &'static str,
-    pub n_processes: fn(usize) -> String,
     pub legend_born: &'static str,
     pub legend_died: &'static str,
     pub legend_note: &'static str,
@@ -324,13 +318,28 @@ pub struct Tm {
     pub col_change: &'static str,
     pub col_avg: &'static str,
     pub col_max: &'static str,
-    pub hung_secs: &'static str,
-    pub cpu_detail: &'static str,
-    pub mem_mb: &'static str,
-    pub commit_mb: &'static str,
-    pub disk_mbs: &'static str,
-    pub gpu_mem_mb: &'static str,
-    pub faults_ps: &'static str,
+    pub col_min: &'static str,
+    /// The one column of an item that only grows: how much it grew over the range.
+    pub col_amount: &'static str,
+    pub mb_per_sec: &'static str,
+    pub kb_per_sec: &'static str,
+    pub seconds_unit: &'static str,
+    pub graph_settings: &'static str,
+    pub graph_off: &'static str,
+    pub graph_show: &'static str,
+    pub graph_hide: &'static str,
+    pub graph_menu: &'static str,
+    pub right_click_settings: &'static str,
+    pub off_q: &'static str,
+    pub off_discards: &'static str,
+    pub off_ok: &'static str,
+    pub dont_ask_again: &'static str,
+    /// What the record takes now: megabytes and samples.
+    pub mem_now: fn(f64, usize) -> String,
+    pub ops_heading: &'static str,
+    pub range_columns: &'static str,
+    pub hide_item: &'static str,
+    pub hide_op: &'static str,
 }
 
 /// The app history page.
@@ -453,6 +462,30 @@ pub struct Settings {
     pub detailed: &'static str,
     pub visible_cols: &'static str,
     pub all: &'static str,
+    pub sec_record: &'static str,
+    pub record: &'static str,
+    pub record_note: &'static str,
+    pub record_interval: &'static str,
+    pub record_days: &'static str,
+    pub record_detail: &'static str,
+    pub record_detail_note: &'static str,
+    pub record_gpu: &'static str,
+    pub record_gpu_note: &'static str,
+    pub record_restart: &'static str,
+    pub record_dir: &'static str,
+    pub record_dir_default: &'static str,
+    pub record_browse: &'static str,
+    pub record_open: &'static str,
+    pub record_reset: &'static str,
+    pub record_dir_note: &'static str,
+    pub record_wal_note: &'static str,
+    /// The warning when the files cannot be written, with the folder being written.
+    pub record_failed: fn(&str) -> String,
+    /// The link under the version, and the title of what it opens.
+    pub licenses: &'static str,
+    pub record_pick: &'static str,
+    pub record_dir_confirm: &'static str,
+    pub record_dir_failed: &'static str,
 }
 
 /// Win32 error codes as sentences.

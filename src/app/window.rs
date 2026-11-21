@@ -139,19 +139,27 @@ pub fn run() {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
     enable_dark_menus();
-    let settings = Settings::load();
+    let mut settings = Settings::load();
     crate::i18n::set(crate::i18n::resolve(settings.language));
     // Start again elevated before any window is made. If the user declines the prompt,
     // this copy carries on without elevation.
-    if settings.elevate_on_start && !actions::is_elevated() && actions::relaunch_elevated() {
+    if settings.elevate_on_start && !actions::is_elevated() && actions::relaunch_elevated(false) {
         return;
     }
+    // Only one copy runs. This comes after the restart above, which ends before it holds anything.
+    let Some(_single) = crate::app::instance::acquire() else {
+        return;
+    };
+    // Settings of the recording changed in the run before apply now, with the old copy gone.
+    settings.apply_pending();
+    let record = crate::system::recorder::plan(&settings);
+    settings.rec_running = record.as_ref().map(|p| p.dir.clone());
     let shared = Shared::new();
     shared.interval_ms.store(settings.interval_ms, Ordering::Relaxed);
 
     unsafe {
         let hinstance = GetModuleHandleW(null());
-        let class = wide("LightTaskManagerWindow");
+        let class = wide(crate::app::instance::WINDOW_CLASS);
         let big = app_icon(48);
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -189,7 +197,7 @@ pub fn run() {
             return;
         }
         shared.hwnd.store(hwnd as isize, Ordering::Relaxed);
-        sampler::start(shared);
+        sampler::start(shared, record);
 
         let app = app_of(hwnd);
         let maximized = (*app).core.settings.maximized;
@@ -226,6 +234,80 @@ unsafe fn save_dialog(owner: HWND, name: &str, kind: &str, ext: &str) -> Option<
     }
     let end = file.iter().position(|c| *c == 0).unwrap_or(file.len());
     Some(std::path::PathBuf::from(String::from_utf16_lossy(&file[..end])))
+}
+
+/// The folder dialog of the current style (the one with the address bar and the navigation pane),
+/// the common item dialog set to pick folders. Returns the chosen folder, or None when cancelled.
+/// windows-sys has no COM vtables, so the few methods needed are called by their slot numbers.
+unsafe fn folder_dialog(owner: HWND, title: &str, start: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    use std::ffi::c_void;
+    use windows_sys::core::GUID;
+    use windows_sys::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED};
+    use windows_sys::Win32::UI::Shell::SHCreateItemFromParsingName;
+
+    const CLSID_FILE_OPEN_DIALOG: GUID = GUID::from_u128(0xDC1C5A9C_E88A_4DDE_A5A1_60F82A20AEF7);
+    const IID_FILE_OPEN_DIALOG: GUID = GUID::from_u128(0xD57C7288_D4AD_4768_BE02_9D969532D960);
+    const IID_SHELL_ITEM: GUID = GUID::from_u128(0x43826D1E_E718_42EE_BC55_A1E261C37BFE);
+    const FOS_PICKFOLDERS: u32 = 0x20;
+    const FOS_FORCEFILESYSTEM: u32 = 0x40;
+    const SIGDN_FILESYSPATH: u32 = 0x8005_8000;
+
+    // The function in slot `i` of a COM object's table.
+    unsafe fn slot<T: Copy>(obj: *mut c_void, i: usize) -> T {
+        let table = *(obj as *const *const usize);
+        std::mem::transmute_copy(&*table.add(i))
+    }
+    unsafe fn release(obj: *mut c_void) {
+        let f: unsafe extern "system" fn(*mut c_void) -> u32 = slot(obj, 2);
+        f(obj);
+    }
+
+    let com = CoInitializeEx(null(), COINIT_APARTMENTTHREADED as u32) >= 0;
+    let mut out = None;
+    let mut dialog: *mut c_void = null_mut();
+    if CoCreateInstance(&CLSID_FILE_OPEN_DIALOG, null_mut(), CLSCTX_INPROC_SERVER, &IID_FILE_OPEN_DIALOG, &mut dialog) >= 0 && !dialog.is_null() {
+        // IFileDialog: SetOptions 9, GetOptions 10, SetFolder 12, SetTitle 17, Show 3, GetResult 20.
+        let get_options: unsafe extern "system" fn(*mut c_void, *mut u32) -> i32 = slot(dialog, 10);
+        let set_options: unsafe extern "system" fn(*mut c_void, u32) -> i32 = slot(dialog, 9);
+        let mut options = 0u32;
+        get_options(dialog, &mut options);
+        set_options(dialog, options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+        let set_title: unsafe extern "system" fn(*mut c_void, *const u16) -> i32 = slot(dialog, 17);
+        set_title(dialog, wide(title).as_ptr());
+        if let Some(start) = start {
+            let mut folder: *mut c_void = null_mut();
+            let path = wide(&start.display().to_string());
+            if SHCreateItemFromParsingName(path.as_ptr(), null_mut(), &IID_SHELL_ITEM, &mut folder) >= 0 && !folder.is_null() {
+                let set_folder: unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32 = slot(dialog, 12);
+                set_folder(dialog, folder);
+                release(folder);
+            }
+        }
+        let show: unsafe extern "system" fn(*mut c_void, HWND) -> i32 = slot(dialog, 3);
+        if show(dialog, owner) >= 0 {
+            let mut result: *mut c_void = null_mut();
+            let get_result: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> i32 = slot(dialog, 20);
+            if get_result(dialog, &mut result) >= 0 && !result.is_null() {
+                // IShellItem::GetDisplayName is slot 5.
+                let get_name: unsafe extern "system" fn(*mut c_void, u32, *mut *mut u16) -> i32 = slot(result, 5);
+                let mut name: *mut u16 = null_mut();
+                if get_name(result, SIGDN_FILESYSPATH, &mut name) >= 0 && !name.is_null() {
+                    let mut len = 0;
+                    while *name.add(len) != 0 {
+                        len += 1;
+                    }
+                    out = Some(std::path::PathBuf::from(String::from_utf16_lossy(std::slice::from_raw_parts(name, len))));
+                    CoTaskMemFree(name as *const _);
+                }
+                release(result);
+            }
+        }
+        release(dialog);
+    }
+    if com {
+        CoUninitialize();
+    }
+    out
 }
 
 unsafe fn app_of(hwnd: HWND) -> *mut App {
@@ -341,6 +423,8 @@ impl App {
                     SetFocus(self.edit);
                 }
                 Cmd::ShowProcess(pid) => {
+                    // The process runs now: show the latest list, not a moment picked on the graph.
+                    self.core.details_go_live();
                     self.core.navigate(0);
                     self.place_edit();
                     // EN_CHANGE applies the filter.
@@ -364,8 +448,33 @@ impl App {
                     InvalidateRect(self.edit, null(), 1);
                     self.core.dirty = true;
                 }
+                Cmd::PickRecDir => {
+                    let current = crate::system::recorder::folder(&self.core.settings.rec_dir);
+                    if let Some(dir) = folder_dialog(self.hwnd, tr().settings.record_pick, current.as_deref()) {
+                        // A folder that holds something already: ask, since the files of this feature would join it.
+                        let busy = crate::system::recorder::has_content(&dir);
+                        let sure = !busy || {
+                            let (text, caption) = (wide(tr().settings.record_dir_confirm), wide(tr().settings.sec_record));
+                            MessageBoxW(self.hwnd, text.as_ptr(), caption.as_ptr(), MB_YESNO | MB_ICONQUESTION) == IDYES
+                        };
+                        if sure {
+                            // The default folder is kept as an empty setting, so that it follows the profile.
+                            let chosen = dir.display().to_string();
+                            let default = crate::system::recorder::default_dir().map(|d| d.display().to_string());
+                            self.core.settings.rec_dir = if default.as_deref() == Some(chosen.as_str()) { String::new() } else { chosen };
+                            self.core.settings.save_recording();
+                        }
+                    }
+                    self.core.dirty = true;
+                }
+                Cmd::OpenRecDir => {
+                    match crate::system::recorder::folder(&self.core.settings.rec_dir) {
+                        Some(dir) if std::fs::create_dir_all(&dir).is_ok() => actions::shell_open(&dir.display().to_string()),
+                        _ => self.core.toast(tr().settings.record_dir_failed.into()),
+                    }
+                }
                 Cmd::Elevate => {
-                    if actions::relaunch_elevated() {
+                    if actions::relaunch_elevated(true) {
                         PostMessageW(self.hwnd, WM_CLOSE, 0, 0);
                     } else {
                         self.core.toast(tr().app.elevate_cancelled.into());
@@ -395,6 +504,9 @@ impl App {
         use crate::pages::details::Reveal;
         self.core.navigate(0);
         self.place_edit();
+        if picked {
+            self.core.details_go_live();
+        }
         let Some(page) = self.core.page_is_details() else { return };
         page.set_aiming(false);
         if picked {
@@ -777,6 +889,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let id = match app.core.cursor(p.x, p.y) {
                 Cursor::Arrow => IDC_ARROW,
                 Cursor::SizeWE => IDC_SIZEWE,
+                Cursor::SizeNS => IDC_SIZENS,
                 Cursor::IBeam => IDC_IBEAM,
             };
             SetCursor(LoadCursorW(null_mut(), id));
@@ -915,7 +1028,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_CLOSE => {
             app.save();
+            // The recording's session ends here, before the process does.
+            app.core.shared.end_recording(false);
             DestroyWindow(hwnd);
+            0
+        }
+        WM_ENDSESSION => {
+            // Windows is shutting down: close the recording so it is not taken for a crash.
+            if wp != 0 {
+                app.save();
+                app.core.shared.end_recording(true);
+            }
             0
         }
         WM_DESTROY => {

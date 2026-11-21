@@ -66,6 +66,8 @@ fn summarize(procs: &[Proc], members: &[u32]) -> Proc {
     s.cpu = 0.0;
     s.gpu_util = 0.0;
     s.gpu_engine = String::new();
+    s.gpu_luid = String::new();
+    s.gpu_kind = String::new();
     macro_rules! zero { ($($f:ident),*) => { $(s.$f = 0;)* } }
     macro_rules! add { ($p:ident, $($f:ident),*) => { $(s.$f += $p.$f;)* } }
     zero!(cpu_time, cycles, ws, peak_ws, ws_delta, disk_bps, net_bps, private_ws, active_private, commit, paged,
@@ -80,6 +82,8 @@ fn summarize(procs: &[Proc], members: &[u32]) -> Proc {
         if p.gpu_util > busiest {
             busiest = p.gpu_util;
             s.gpu_engine = p.gpu_engine.clone();
+            s.gpu_luid = p.gpu_luid.clone();
+            s.gpu_kind = p.gpu_kind.clone();
         }
         add!(p, cpu_time, cycles, ws, peak_ws, ws_delta, disk_bps, net_bps, private_ws, active_private, commit, paged,
             nonpaged, page_faults, pf_delta, handles, threads, user_objects, gdi_objects, io_reads, io_writes, io_other,
@@ -170,6 +174,8 @@ mod tests {
             disk_bps: 1,
             gpu_util: 0.0,
             gpu_engine: String::new(),
+            gpu_luid: String::new(),
+            gpu_kind: String::new(),
             gpu_dedicated: 0,
             gpu_shared: 0,
             net_bps: 0,

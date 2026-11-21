@@ -4,6 +4,8 @@
 pub mod actions;
 pub mod demand;
 pub mod model;
+pub mod recorder;
 pub mod sampler;
+pub mod sqlite;
 pub mod sysinfo;
 pub mod win;

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 fn live_snapshot(shared: &Arc<Shared>) -> Arc<Snapshot> {
     shared.icon_px.store(16, Ordering::Relaxed);
-    sampler::start(shared.clone());
+    sampler::start(shared.clone(), None);
     // The second sample carries real CPU numbers and finished enrichment.
     std::thread::sleep(Duration::from_millis(2200));
     let snap = shared.slot.lock().unwrap().take();
@@ -47,6 +47,8 @@ fn inflate(base: &Snapshot, rows: usize) -> Arc<Snapshot> {
         }
     }
     Arc::new(Snapshot {
+        taken: base.taken,
+        stale: base.stale,
         procs,
         has_procs: true,
         cpu_total: base.cpu_total,
@@ -140,15 +142,15 @@ pub fn shot(args: &[String]) {
     let from_start = extra.iter().any(|a| a == "from_start");
     let live = if from_start {
         shared.icon_px.store(16, Ordering::Relaxed);
-        sampler::start(shared.clone());
+        sampler::start(shared.clone(), None);
         Arc::new(Snapshot::default())
     } else {
         live_snapshot(&shared)
     };
-    // `tm_gpu` records GPU use in the time machine from the start.
-    // `tm_off` turns the time machine off.
+    // `tm_gpu` records GPU use in the graph from the start.
+    // `tm_off` turns the graph off.
     let settings = Settings {
-        // `tm=key,key` picks the time machine's targets.
+        // `tm=key,key` picks the graph's lines.
         tm_targets: if let Some(list) = extra.iter().find_map(|a| a.strip_prefix("tm=")) {
             list.split(',').map(String::from).collect()
         } else if extra.iter().any(|a| a == "tm_gpu") {
@@ -163,6 +165,9 @@ pub fn shot(args: &[String]) {
             Some("tree") => crate::settings::ViewMode::Tree,
             _ => crate::settings::ViewMode::Group,
         },
+        // `rec_failed` shows the recording as unable to write; `rec_dir=path` picks its folder.
+        rec_dir: extra.iter().find_map(|a| a.strip_prefix("rec_dir=")).unwrap_or("").to_string(),
+        rec_running: extra.iter().any(|a| a == "rec_failed").then(|| std::path::PathBuf::from(r"X:\no\history")),
         ..Default::default()
     };
     // `size=w,h` sets the window size (default 1240x760).
@@ -172,6 +177,9 @@ pub fn shot(args: &[String]) {
         .and_then(|v| v.split_once(','))
         .and_then(|(w, h)| Some((w.trim().parse().ok()?, h.trim().parse().ok()?)))
         .unwrap_or((1240, 760));
+    if extra.iter().any(|a| a == "rec_failed") {
+        crate::system::recorder::FAILED.store(true, Ordering::Relaxed);
+    }
     let mut core = Core::new(settings, shared.clone(), 1.0, size.0, size.1);
     core.navigate(page);
     core.on_snapshot(&live);
@@ -233,7 +241,7 @@ pub fn shot(args: &[String]) {
         let settings = Settings { view: core.settings.view, ..Default::default() };
         core.page_is_details().unwrap().simulate_lifetime_for_test(&settings);
     }
-    // Input to replay before the picture: type=text  click=x,y  drag=x1,y1,x2,y2  move=x,y  zoom=x,y,notches (Ctrl+wheel).
+    // Input to replay before the picture: type=text  click=x,y  rclick=x,y  drag=x1,y1,x2,y2  move=x,y  zoom=x,y,notches (Ctrl+wheel).
     // Pages learn where things are while painting, so paint once first.
     core.render();
     for a in extra {
@@ -259,6 +267,11 @@ pub fn shot(args: &[String]) {
             ("click", [x, y]) => {
                 fire(Ev::Move { x: *x, y: *y });
                 fire(Ev::Down { x: *x, y: *y, right: false });
+                fire(Ev::Up { x: *x });
+            }
+            ("rclick", [x, y]) => {
+                fire(Ev::Move { x: *x, y: *y });
+                fire(Ev::Down { x: *x, y: *y, right: true });
                 fire(Ev::Up { x: *x });
             }
             ("drag", [x1, y1, x2, y2]) => {

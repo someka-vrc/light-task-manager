@@ -35,6 +35,30 @@ fn paint_view_icon(c: &mut Canvas, area: Rect, mode: ViewMode, color: u32) {
     }
 }
 
+/// The groups of a column picker: the process table's columns, or the range table's items.
+pub(super) fn picker_groups(ranged: bool) -> Vec<PickGroup> {
+    if ranged {
+        range::PICKER
+            .iter()
+            .map(|(name, items)| (name(tr()).to_string(), items.iter().map(|i| (Pick::Item(*i), i.full())).collect()))
+            .collect()
+    } else {
+        columns::GROUPS
+            .iter()
+            .map(|(name, cols)| (name(tr()).to_string(), cols.iter().map(|c| (Pick::Col(*c), columns::def(*c).full().to_string())).collect()))
+            .collect()
+    }
+}
+
+/// Whether a picker's checkbox is on.
+pub(super) fn picked(s: &Settings, pick: Pick) -> bool {
+    match pick {
+        Pick::Col(c) => s.columns.iter().any(|(x, _)| *x == c),
+        Pick::Item(i) => s.range_items.iter().any(|(x, _)| *x == i),
+        Pick::Op(o) => s.range_ops & o.bit() != 0,
+    }
+}
+
 /// The expand-all (pointing down) and collapse-all (pointing up) icons.
 fn paint_double_chevron(c: &mut Canvas, area: Rect, up: bool, color: u32) {
     let ch = if up { icons::CHEVRON_UP } else { icons::CHEVRON_DOWN };
@@ -61,11 +85,27 @@ impl DetailsPage {
     pub(super) fn layout(&mut self, c: &Canvas, area: Rect, settings: &Settings) {
         let toolbar = c.px(60);
         let side = c.px(12);
-        let table = rect(area.x + side, area.y + toolbar, area.w - side * 2, area.h - toolbar);
-        let (row_h, header_h) = (c.px(28), c.px(32));
+        // Under the toolbar: the paused bar, the graph and the border to drag, then the table.
+        let bar_h = if settings.tm_enabled { self.tl.bar_height(c) } else { 0 };
+        let bar_area = rect(area.x, area.y + toolbar, area.w, bar_h);
+        let mut top = bar_area.b();
+        let (mut graph, mut split) = (Rect::default(), Rect::default());
+        if settings.tm_enabled {
+            let room = area.b() - top - c.px(160);
+            let gh = c.px(settings.tm_graph_h as i32).min(room).max(c.px(120).min(room.max(0)));
+            graph = rect(area.x + c.px(20), top, area.w - c.px(40), gh);
+            split = rect(area.x, graph.b(), area.w, c.px(12));
+            top = split.b();
+        }
+        let table = rect(area.x + side, top, area.w - side * 2, area.b() - top);
+        let ranged = self.range.is_some();
+        let row_h = c.px(28);
+        let group_h = if ranged { c.px(22) } else { 0 };
+        let header_h = c.px(32) + group_h;
         let mut x = 0;
-        let mut cols = Vec::with_capacity(settings.columns.len());
-        for (col, w) in &settings.columns {
+        let shown = self.shown_columns(settings);
+        let mut cols = Vec::with_capacity(shown.len());
+        for (col, w) in &shown {
             let w = c.px(*w as i32);
             cols.push(ColBox { col: *col, x, w });
             x += w;
@@ -81,6 +121,11 @@ impl DetailsPage {
         let view_btn = rect(col_btn.x - c.px(6) - view_w, btn_y, view_w, btn_h);
         let collapse_btn = rect(view_btn.x - c.px(6) - btn_h, btn_y, btn_h, btn_h);
         let expand_btn = rect(collapse_btn.x - c.px(4) - btn_h, btn_y, btn_h, btn_h);
+        // The graph button sits left of the others; like the view button it carries an arrow.
+        let before = if self.mode == ViewMode::Flat { view_btn.x } else { expand_btn.x };
+        let graph_w = btn_h + c.px(22);
+        let graph_btn = rect(before - c.px(10) - graph_w, btn_y, graph_w, btn_h);
+        let graph_arrow = rect(graph_btn.r() - c.px(22), btn_y, c.px(22), btn_h);
         self.l = Layout {
             area,
             table,
@@ -98,6 +143,12 @@ impl DetailsPage {
             view_btn,
             expand_btn,
             collapse_btn,
+            graph_btn,
+            graph_arrow,
+            bar_area,
+            graph,
+            split,
+            group_h,
             chevron: c.px(18),
             indent: c.px(20),
         };
@@ -118,12 +169,28 @@ impl DetailsPage {
         let title_w = c.measure(title, Font::Title);
         let toolbar = rect(area.x + c.px(20), area.y, title_w + c.px(4), c.px(60));
         // In a narrow window the buttons take the room and the title goes.
-        let leftmost = if self.mode == ViewMode::Flat { l.view_btn.x } else { l.expand_btn.x };
-        if toolbar.r() + c.px(12) <= leftmost {
+        if toolbar.r() + c.px(12) <= l.graph_btn.x {
             c.text(title, Font::Title, toolbar, t.text, Align::Left);
         }
 
         let r = c.px(6) as f32;
+        // The graph button: lit while the graph is on.
+        let gb = l.graph_btn;
+        let on = settings.tm_enabled;
+        let bg = if on { t.selection } else { t.content };
+        c.round(gb, r, bg, 255);
+        let part = |hover: bool, area: Rect, c: &mut Canvas| {
+            if hover {
+                c.round(area, r, t.hover, 255);
+            }
+        };
+        let icon = rect(gb.x, gb.y, gb.w - l.graph_arrow.w, gb.h);
+        part(self.hover_graph == 1, icon, c);
+        part(self.hover_graph == 2, l.graph_arrow, c);
+        c.text(&glyph(icons::TIMELINE), Font::Icon, icon, if on { t.accent } else { t.text }, Align::Center);
+        c.text(&glyph(icons::CHEVRON_DOWN), Font::IconSmall, l.graph_arrow, t.text_dim, Align::Center);
+        c.tip(icon, if on { tr().tm.graph_hide } else { tr().tm.graph_show });
+        c.tip(l.graph_arrow, tr().tm.graph_menu);
         let view_btn = l.view_btn;
         let menu_open = matches!(&self.overlay, Overlay::Menu { items, .. } if items.iter().any(|i| matches!(i.act, Act::View(_))));
         c.round(view_btn, r, if menu_open { t.pressed } else if self.hover_view { t.hover } else { t.content }, 255);
@@ -153,7 +220,7 @@ impl DetailsPage {
         paint_crosshair(c, aim_btn, if self.aiming { t.accent } else { t.text });
         c.tip(aim_btn, tr().details.find_by_window);
 
-        let can_end = self.selected_proc().is_some();
+        let can_end = !self.end_targets().is_empty();
         let end_btn = l.end_btn;
         let fg = if can_end { t.text } else { t.text_faint };
         if can_end && self.hover_end {
@@ -166,36 +233,80 @@ impl DetailsPage {
 
     pub(super) fn paint_header(&mut self, c: &mut Canvas, settings: &Settings) {
         let t = THEME;
-        let (table, pad, header_h) = (self.l.table, self.l.pad, self.l.header_h);
+        let (table, pad, header_h, group_h) = (self.l.table, self.l.pad, self.l.header_h, self.l.group_h);
         let top = rect(table.x, table.y, table.w, header_h);
         c.set_clip(top);
+        // The range table has a top row naming each item over its columns.
+        if group_h > 0 {
+            let cols = &self.l.cols;
+            let mut i = 0;
+            while i < cols.len() {
+                let AnyCol::R(rc) = cols[i].col else { break };
+                let mut j = i + 1;
+                while j < cols.len() && matches!(cols[j].col, AnyCol::R(o) if o.item == rc.item) {
+                    j += 1;
+                }
+                if rc.item.kind() != range::Kind::Single {
+                    let x = table.x + cols[i].x - self.scroll_x;
+                    let w = cols[j - 1].x + cols[j - 1].w - cols[i].x;
+                    let label = rc.item.label();
+                    c.text(&label, Font::Small, rect(x + pad, table.y + c.px(2), w - pad * 2, group_h), t.text, Align::Center);
+                    c.fill(rect(x + pad / 2, table.y + group_h, w - pad, 1), t.border);
+                }
+                i = j;
+            }
+        }
         for (i, b) in self.l.cols.iter().enumerate() {
             let x = table.x + b.x - self.scroll_x;
             if x + b.w < table.x || x > table.r() {
                 continue;
             }
-            let cell = rect(x, table.y, b.w, header_h);
+            let cell = rect(x, table.y + group_h, b.w, header_h - group_h);
             if self.hover_header == Some(i) && !self.hover_edge {
                 c.round(cell.inset(c.px(2), c.px(3)), c.px(4) as f32, t.hover, 255);
             }
-            let d = columns::def(b.col);
-            let sorted = settings.sort == b.col;
+            let (sorted, desc) = match b.col {
+                AnyCol::P(col) => (settings.sort == col, settings.descending),
+                AnyCol::R(col) => (settings.range_sort == col, settings.range_desc),
+            };
             let arrow = if sorted { c.px(14) } else { 0 };
-            let text_area = rect(x + pad, table.y, b.w - pad * 2 - arrow, header_h);
-            let align = if d.right { Align::Right } else { Align::Left };
+            let text_area = rect(x + pad, cell.y, b.w - pad * 2 - arrow, cell.h);
+            let align = if b.col.right() { Align::Right } else { Align::Left };
             let color = if sorted { t.text } else { t.text_dim };
-            c.text(d.label(), Font::Small, text_area, color, align);
+            c.text(&b.col.label(), Font::Small, text_area, color, align);
             if sorted {
-                let ch = if settings.descending { icons::CHEVRON_DOWN } else { icons::CHEVRON_UP };
-                let a = rect(x + b.w - pad - arrow, table.y, arrow, header_h);
+                let ch = if desc { icons::CHEVRON_DOWN } else { icons::CHEVRON_UP };
+                let a = rect(x + b.w - pad - arrow, cell.y, arrow, cell.h);
                 c.text(&glyph(ch), Font::IconSmall, a, t.accent, Align::Right);
             }
             if self.hover_header == Some(i) && self.hover_edge {
-                c.fill(rect(x + b.w - 1, table.y + c.px(7), c.px(2), header_h - c.px(14)), t.accent);
+                c.fill(rect(x + b.w - 1, cell.y + c.px(7), c.px(2), cell.h - c.px(14)), t.accent);
             }
         }
         c.reset_clip();
         c.fill(rect(table.x, table.y + header_h - 1, table.w, 1), t.border);
+    }
+
+    /// Over the range table's time heading: what its marks mean.
+    pub(super) fn paint_time_tip(&self, c: &mut Canvas) {
+        let Some(i) = self.hover_header.filter(|_| !self.hover_edge) else { return };
+        let Some(b) = self.l.cols.get(i) else { return };
+        if !matches!(b.col, AnyCol::R(RCol { item: RItem::Time | RItem::Mark, .. })) {
+            return;
+        }
+        let t = THEME;
+        let lines = [tr().tm.legend_born, tr().tm.legend_died, tr().tm.legend_note];
+        let lh = c.px(20);
+        let w = lines.iter().map(|l| c.measure(l, Font::Small)).max().unwrap_or(0) + c.px(20);
+        let h = lh * lines.len() as i32 + c.px(12);
+        let area = self.l.area;
+        let x = (self.l.table.x + b.x - self.scroll_x).min(area.r() - w - c.px(8)).max(area.x);
+        let r = rect(x, self.l.body.y + c.px(4), w, h);
+        c.round(r, c.px(5) as f32, t.popup, 250);
+        c.stroke(r, c.px(5) as f32, 1.0, t.border, 255);
+        for (k, line) in lines.iter().enumerate() {
+            c.text(line, Font::Small, rect(r.x + c.px(10), r.y + c.px(6) + lh * k as i32, w - c.px(20), lh), t.text, Align::Left);
+        }
     }
 
     pub(super) fn paint_rows(&mut self, c: &mut Canvas) {
@@ -252,9 +363,8 @@ impl DetailsPage {
                     continue;
                 }
                 let mut cell = rect(x + pad, y, b.w - pad * 2, rh);
-                let d = columns::def(b.col);
                 let mut color = if ended { t.died } else if m.faded { t.text_faint } else { t.text };
-                if b.col == Col::Name {
+                if b.col.is_name() {
                     if self.mode != ViewMode::Flat {
                         let at = m.depth as i32 * indent;
                         if matches!(kind, Row::Group(_)) || m.branch {
@@ -277,15 +387,27 @@ impl DetailsPage {
                     color = t.text_faint;
                 } else if !is_selected {
                     color = t.text_dim;
-                    if b.col == Col::Cpu && p.cpu.round() >= 1.0 && p.pid != 0 {
-                        color = t.text;
-                    } else if b.col == Col::Status && p.status == crate::system::model::Status::NotResponding {
-                        color = t.warn;
+                    match b.col {
+                        AnyCol::P(Col::Cpu) if p.cpu.round() >= 1.0 && p.pid != 0 => color = t.text,
+                        AnyCol::P(Col::Status) if p.status == crate::system::model::Status::NotResponding => color = t.warn,
+                        // Born, died, and time not responding stand out in the range table.
+                        AnyCol::R(rc) => {
+                            if let (Some(data), Some(w)) = (&self.range, Self::which(kind)) {
+                                let l = data.life(w);
+                                match rc.item {
+                                    RItem::Mark | RItem::Time if l.died => color = t.died,
+                                    RItem::Mark | RItem::Time if l.born => color = t.born,
+                                    RItem::Hung if l.hung > 0 => color = t.died,
+                                    _ => {}
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 buf.clear();
-                fill_cell(b.col, p, members, &self.scale, &mut buf);
-                let align = if d.right { Align::Right } else { Align::Left };
+                self.cell_text(b.col, kind, members, &mut buf);
+                let align = if b.col.right() { Align::Right } else { Align::Left };
                 c.text(&buf, Font::Body, cell, color, align);
             }
         }
@@ -321,7 +443,7 @@ impl DetailsPage {
             if let Some(b) = self.l.cols.get(idx) {
                 let ghost = rect(x - b.w / 2, table.y + c.px(2), b.w, self.l.header_h - c.px(4));
                 c.round(ghost, c.px(4) as f32, t.pressed, 230);
-                c.text(columns::def(b.col).label(), Font::Small, ghost.inset(pad, 0), t.text, Align::Left);
+                c.text(&b.col.label(), Font::Small, ghost.inset(pad, 0), t.text, Align::Left);
             }
             c.reset_clip();
         }
@@ -399,6 +521,8 @@ impl DetailsPage {
                 c.text(s.cancel, Font::Body, buttons[1], t.text, Align::Center);
             }
             Overlay::Columns { hover, cells, hover_btn, buttons, panel, scroll, max_scroll, list, line } => {
+                let ranged = self.range.is_some();
+                let groups = picker_groups(ranged);
                 c.fill_alpha(area, 0, 110);
                 let cell_h = c.px(30);
                 let gap = c.px(24);
@@ -406,7 +530,7 @@ impl DetailsPage {
                 // Use the most panels that still fit the window; with one panel, labels may be cut.
                 let mut chosen: Option<(PickerLayout, Vec<i32>)> = None;
                 for layout in PICKER_LAYOUTS.iter() {
-                    let widths = picker_panel_widths(c, layout);
+                    let widths = picker_panel_widths(c, layout, &groups);
                     let total = widths.iter().sum::<i32>() + gap * (widths.len() as i32 - 1) + c.px(32);
                     let fits = total <= area.w - margin;
                     chosen = Some((*layout, widths));
@@ -423,20 +547,23 @@ impl DetailsPage {
                 }
                 let w = (x_acc - gap + c.px(16)).min(area.w - margin);
                 // Heights in half rows: a heading and each column take 2, the gap between groups 1.
-                let half_rows = |groups: &[usize]| -> i32 {
-                    let items: i32 = groups.iter().map(|g| 2 + 2 * columns::GROUPS[*g].1.len() as i32).sum();
-                    items + groups.len().saturating_sub(1) as i32
+                let half_rows = |members: &[usize]| -> i32 {
+                    let items: i32 = members.iter().map(|g| 2 + 2 * groups[*g].1.len() as i32).sum();
+                    items + members.len().saturating_sub(1) as i32
                 };
                 let rows_half = layout.iter().map(|g| half_rows(g)).max().unwrap_or(0);
+                // The range table's operations take a row of their own above the items.
+                let ops_h = if ranged { cell_h * 2 + cell_h / 2 } else { 0 };
                 let head = c.px(56);
                 let foot = c.px(60);
-                let content_h = rows_half * cell_h / 2;
+                let content_h = rows_half * cell_h / 2 + ops_h;
                 // The panel is as tall as its content, but never taller than the window allows.
                 let h = (head + content_h + foot).min(area.h - c.px(32)).max(head + foot);
                 let r = rect(area.x + (area.w - w) / 2, area.y + (area.h - h).max(0) / 2, w, h);
                 *panel = r;
                 Self::panel(c, r);
-                c.text(tr().details.pick_columns, Font::Semi, rect(r.x + c.px(22), r.y + c.px(16), r.w, c.px(28)), t.text, Align::Left);
+                let title = if ranged { tr().tm.range_columns } else { tr().details.pick_columns };
+                c.text(title, Font::Semi, rect(r.x + c.px(22), r.y + c.px(16), r.w, c.px(28)), t.text, Align::Left);
                 let viewport = rect(r.x, r.y + head, r.w, h - head - foot);
                 *list = viewport;
                 *line = cell_h;
@@ -444,35 +571,53 @@ impl DetailsPage {
                 *scroll = (*scroll).clamp(0, *max_scroll);
                 cells.clear();
                 c.set_clip(viewport);
-                for (p, groups) in layout.iter().enumerate() {
+                let checkbox = |c: &mut Canvas, cell: Rect, on: bool, hovered: bool, label: &str| {
+                    if hovered {
+                        c.round(cell.inset(c.px(2), c.px(1)), c.px(4) as f32, t.pressed, 255);
+                    }
+                    let box_size = c.px(16);
+                    let bx = rect(cell.x + c.px(8), cell.y + (cell.h - box_size) / 2, box_size, box_size);
+                    if on {
+                        c.round(bx, c.px(3) as f32, t.accent, 255);
+                        c.text(&glyph(icons::CHECK), Font::IconSmall, bx, t.on_accent, Align::Center);
+                    } else {
+                        c.stroke(bx, c.px(3) as f32, 1.0, t.text_faint, 255);
+                    }
+                    let label_r = rect(bx.r() + c.px(8), cell.y, cell.r() - bx.r() - c.px(12), cell.h);
+                    c.text(label, Font::Small, label_r, t.text, Align::Left);
+                };
+                if ranged {
+                    // The operations, in one row: each turns its column on or off for every item.
+                    let y = viewport.y - *scroll;
+                    let x0 = r.x + panel_x.first().copied().unwrap_or(c.px(16));
+                    c.text(tr().tm.ops_heading, Font::Semi, rect(x0 + c.px(8), y, r.w, cell_h), t.text_dim, Align::Left);
+                    let mut x = x0;
+                    for op in range::OPS {
+                        let label = op.label();
+                        let w = c.measure(label, Font::Small) + c.px(44);
+                        let cell = rect(x, y + cell_h, w, cell_h);
+                        let i = cells.len();
+                        cells.push((cell, Pick::Op(op)));
+                        checkbox(c, cell, picked(settings, Pick::Op(op)), *hover == Some(i), label);
+                        x += w + c.px(4);
+                    }
+                }
+                for (p, members) in layout.iter().enumerate() {
                     let px = r.x + panel_x[p];
                     let cell_w = panel_w[p];
-                    let mut y = viewport.y - *scroll;
-                    for (gi, g) in groups.iter().enumerate() {
+                    let mut y = viewport.y - *scroll + ops_h;
+                    for (gi, g) in members.iter().enumerate() {
                         if gi > 0 {
                             y += cell_h / 2;
                         }
-                        let (name, members) = columns::GROUPS[*g];
-                        c.text(name(tr()), Font::Semi, rect(px + c.px(8), y, cell_w - c.px(8), cell_h), t.text_dim, Align::Left);
+                        let (name, items) = &groups[*g];
+                        c.text(name, Font::Semi, rect(px + c.px(8), y, cell_w - c.px(8), cell_h), t.text_dim, Align::Left);
                         y += cell_h;
-                        for col in members.iter() {
+                        for (pick, label) in items.iter() {
                             let cell = rect(px, y, cell_w, cell_h);
                             let i = cells.len();
-                            cells.push((cell, *col));
-                            if *hover == Some(i) {
-                                c.round(cell.inset(c.px(2), c.px(1)), c.px(4) as f32, t.pressed, 255);
-                            }
-                            let box_size = c.px(16);
-                            let bx = rect(cell.x + c.px(8), cell.y + (cell_h - box_size) / 2, box_size, box_size);
-                            let on = settings.columns.iter().any(|(s, _)| s == col);
-                            if on {
-                                c.round(bx, c.px(3) as f32, t.accent, 255);
-                                c.text(&glyph(icons::CHECK), Font::IconSmall, bx, t.on_accent, Align::Center);
-                            } else {
-                                c.stroke(bx, c.px(3) as f32, 1.0, t.text_faint, 255);
-                            }
-                            let label = rect(bx.r() + c.px(8), cell.y, cell.r() - bx.r() - c.px(12), cell_h);
-                            c.text(columns::def(*col).full(), Font::Small, label, t.text, Align::Left);
+                            cells.push((cell, *pick));
+                            checkbox(c, cell, picked(settings, *pick), *hover == Some(i), label);
                             y += cell_h;
                         }
                     }

@@ -387,14 +387,6 @@ impl Row {
     }
 }
 
-/// A heading over adjacent columns, drawn as the top row of a two-row header.
-#[derive(Clone, Copy)]
-pub struct Group {
-    pub label: Text,
-    pub first: usize,
-    pub len: usize,
-}
-
 #[derive(Clone)]
 pub struct Column {
     pub label: Text,
@@ -420,8 +412,7 @@ pub enum TableOut {
 }
 
 pub struct Table {
-    cols: std::borrow::Cow<'static, [Column]>,
-    groups: Vec<Group>,
+    cols: &'static [Column],
     /// Column 0 gives up width (down to a minimum) when the columns do not fit.
     pub shrink_first: bool,
     rows: Vec<Row>,
@@ -460,8 +451,7 @@ pub struct Table {
 impl Table {
     pub fn new(cols: &'static [Column], sort: usize, desc: bool) -> Self {
         Self {
-            cols: std::borrow::Cow::Borrowed(cols),
-            groups: Vec::new(),
+            cols,
             shrink_first: false,
             rows: Vec::new(),
             view: Vec::new(),
@@ -498,28 +488,6 @@ impl Table {
         self.rows.len()
     }
 
-    /// Replaces the columns (and the group headings over them); the rows must be set again.
-    pub fn set_columns(&mut self, cols: Vec<Column>, groups: Vec<Group>, sort: usize, desc: bool) {
-        self.cols = std::borrow::Cow::Owned(cols);
-        self.groups = groups;
-        self.sort = sort;
-        self.desc = desc;
-        self.rows.clear();
-        self.view.clear();
-        self.hover_header = None;
-        self.pressed_header = None;
-    }
-
-    /// The column whose heading is under the mouse.
-    pub fn header_hover(&self) -> Option<usize> {
-        self.hover_header
-    }
-
-    /// Where a column's heading was last painted.
-    pub fn header_rect(&self, i: usize) -> Option<Rect> {
-        self.xs.get(i).map(|(x, w)| rect(*x, self.table.y, *w, self.header_h))
-    }
-
     pub fn shown(&self) -> usize {
         self.view.len()
     }
@@ -532,16 +500,6 @@ impl Table {
             }
         }
         self.resort();
-    }
-
-    /// Row ids in the order shown, after sorting and filtering.
-    pub fn visible_ids(&self) -> Vec<u64> {
-        self.view.iter().map(|i| self.rows[*i].id).collect()
-    }
-
-    /// Whether the filter hides anything, or would.
-    pub fn filtering(&self) -> bool {
-        !self.filter.is_empty()
     }
 
     pub fn set_filter(&mut self, text: &str) {
@@ -876,9 +834,7 @@ impl Table {
         let t = THEME;
         self.table = area;
         self.row_h = c.px(28);
-        // A row of group headings goes above the column headings when there are groups.
-        let group_h = if self.groups.is_empty() { 0 } else { c.px(24) };
-        self.header_h = c.px(32) + group_h;
+        self.header_h = c.px(32);
         self.pad = c.px(10);
         self.bar = c.px(12);
         self.body = rect(area.x, area.y + self.header_h, area.w, area.h - self.header_h);
@@ -906,19 +862,9 @@ impl Table {
         // Header.
         let (pad, header_h) = (self.pad, self.header_h);
         c.set_clip(rect(area.x, area.y, area.w, header_h));
-        for g in &self.groups {
-            let Some(&(gx, _)) = self.xs.get(g.first) else { continue };
-            let Some(&(lx, lw)) = self.xs.get(g.first + g.len - 1) else { continue };
-            let gr = rect(gx, area.y, lx + lw - gx, group_h);
-            c.text((g.label)(tr()), Font::Small, gr, t.text, Align::Center);
-            c.fill(rect(gr.x + pad, gr.b() - 1, gr.w - pad * 2, 1), t.border);
-        }
         for (i, k) in self.cols.iter().enumerate() {
             let (x, w) = self.xs[i];
-            // Columns under a group heading take the lower row; the others span both rows.
-            let grouped = self.groups.iter().any(|g| i >= g.first && i < g.first + g.len);
-            let top = if grouped { area.y + group_h } else { area.y };
-            let cell = rect(x, top, w, area.y + header_h - top);
+            let cell = rect(x, area.y, w, header_h);
             if self.hover_header == Some(i) {
                 c.round(cell.inset(c.px(2), c.px(3)), c.px(4) as f32, t.hover, 255);
             }

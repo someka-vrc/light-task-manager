@@ -7,7 +7,7 @@
 //! declare its needs; nothing else has to know about it.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 /// Things the sampler reads only on demand.
 pub mod need {
@@ -43,11 +43,13 @@ pub struct Demand {
     slots: Mutex<Vec<Needs>>,
     /// The consumer that is shown, or `usize::MAX` for none.
     visible: AtomicUsize,
+    /// What a consumer that is no page needs at all times: the recording to the database.
+    background: AtomicU32,
 }
 
 impl Default for Demand {
     fn default() -> Self {
-        Self { slots: Mutex::new(Vec::new()), visible: AtomicUsize::new(usize::MAX) }
+        Self { slots: Mutex::new(Vec::new()), visible: AtomicUsize::new(usize::MAX), background: AtomicU32::new(0) }
     }
 }
 
@@ -66,8 +68,20 @@ impl Demand {
         self.current(minimized) & !before != 0
     }
 
-    /// What has to be read now.
+    /// Sets what the recording needs. Returns true when this adds something to read.
+    pub fn set_background(&self, needs: u32, minimized: bool) -> bool {
+        let before = self.current(minimized);
+        self.background.store(needs, Ordering::Relaxed);
+        self.current(minimized) & !before != 0
+    }
+
+    /// What has to be read now: what the pages and the recording need.
     pub fn current(&self, minimized: bool) -> u32 {
+        self.screen(minimized) | self.background.load(Ordering::Relaxed)
+    }
+
+    /// What the pages need read now, which decides whether the screen is sampled.
+    pub fn screen(&self, minimized: bool) -> u32 {
         let visible = self.visible.load(Ordering::Relaxed);
         let slots = self.slots.lock().unwrap();
         let mut out = if minimized { 0 } else { need::LIVE };

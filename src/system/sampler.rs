@@ -7,11 +7,13 @@
 use crate::system::demand::{need, Demand, Needs};
 use crate::system::model::*;
 use crate::system::model::ProcTotals;
+use crate::system::recorder;
 use crate::system::sysinfo::SysSampler;
+use crate::system::win::filetime_now;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU32, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use windows_sys::Win32::Foundation::*;
@@ -120,6 +122,8 @@ pub struct Shared {
     /// What the pages need read; costly counters run only while something needs them.
     pub demand: Demand,
     force: AtomicBool,
+    /// The recording's writer thread mailbox, when the recording is on and the sampler has started.
+    pub recorder: Mutex<Option<SyncSender<recorder::Msg>>>,
 }
 
 impl Shared {
@@ -135,7 +139,17 @@ impl Shared {
             enrich_posted: AtomicBool::new(false),
             demand: Demand::default(),
             force: AtomicBool::new(true),
+            recorder: Mutex::new(None),
         })
+    }
+
+    /// Writes the end of the recording's session and waits until it is on disk.
+    /// `shutdown`: Windows is shutting down.
+    pub fn end_recording(&self, shutdown: bool) {
+        let tx = self.recorder.lock().unwrap().clone();
+        if let Some(tx) = tx {
+            recorder::shutdown(&tx, shutdown);
+        }
     }
 
     /// What has to be read now.
@@ -197,38 +211,153 @@ pub struct Sampler {
     procs_stale: bool,
 }
 
-pub fn start(shared: Arc<Shared>) {
+/// Starts the sampler. `record` is the recording to the database, fixed for the whole run.
+pub fn start(shared: Arc<Shared>, record: Option<recorder::Plan>) {
     let (tx, rx) = channel();
     let enrich_shared = shared.clone();
     std::thread::Builder::new()
         .name("enrich".into())
         .spawn(move || enrich_loop(rx, enrich_shared))
         .ok();
+    let record = record.map(|plan| {
+        // The recording declares what it needs read, as a page does.
+        let gpu = plan.cfg.gpu;
+        // The user and GDI object counts are always recorded, so they are always read.
+        let base = need::SYS | need::PROCS | need::GUI_COUNTS;
+        let needs = if gpu { base | need::SYS_GPU | need::PROC_GPU } else { base };
+        shared.demand.set_background(needs, shared.minimized.load(Ordering::Relaxed));
+        let ms = plan.ms;
+        let tx = recorder::start(plan);
+        *shared.recorder.lock().unwrap() = Some(tx.clone());
+        (ms, tx)
+    });
     std::thread::Builder::new()
         .name("sampler".into())
-        .spawn(move || {
-            let mut s = Sampler::new(shared.clone(), tx);
-            loop {
-                let scheduled = shared.needs() & need::LIVE != 0
-                    && shared.interval_ms.load(Ordering::Relaxed) != 0;
-                if shared.force.swap(false, Ordering::AcqRel) || scheduled {
-                    publish(&shared, s.sample());
-                }
-                wait(&shared);
-            }
-        })
+        .spawn(move || sample_loop(shared, tx, record))
         .ok();
 }
 
-fn publish(shared: &Shared, snap: Snapshot) {
-    *shared.slot.lock().unwrap() = Some(Arc::new(snap));
+/// A repeating schedule, kept on a grid of multiples of its interval counted from the
+/// Unix epoch (in milliseconds). Every consumer's grid is the same, so their times
+/// coincide wherever one interval divides the other and one sample serves them all.
+struct Timer {
+    /// 0 while the schedule is not running.
+    interval: i64,
+    next: i64,
+    /// The schedule has just started and has not been served yet.
+    first: bool,
+}
+
+impl Timer {
+    /// Waits are about 15 ms accurate; a schedule that is due this soon counts as due now.
+    const TOLERANCE: i64 = 30;
+
+    fn new() -> Self {
+        Self { interval: 0, next: 0, first: false }
+    }
+
+    /// Whether the schedule is due at `now`. Whoever takes the sample then calls `served`.
+    fn due(&mut self, active: bool, interval: i64, now: i64) -> bool {
+        if !active || interval <= 0 {
+            self.interval = 0;
+            return false;
+        }
+        if self.interval == 0 {
+            // Just started: the first sample is due at once.
+            self.interval = interval;
+            self.next = now;
+            self.first = true;
+        } else if self.interval != interval {
+            self.interval = interval;
+            self.next = (now + interval - 1).div_euclid(interval) * interval;
+        } else if self.next - now > 2 * interval + Self::TOLERANCE {
+            // The clock was set back (more than the one interval a skipped time can add): wait for
+            // the next time on the grid, not for the old time.
+            self.next = (now + interval - 1).div_euclid(interval) * interval;
+        }
+        now + Self::TOLERANCE >= self.next
+    }
+
+    /// A sample was finished at `now` for this schedule: its next time is the next one on the
+    /// grid, so the times it missed are skipped and a slow sample is not followed at once by another.
+    fn served(&mut self, now: i64) {
+        if self.interval > 0 {
+            self.next = (now + Self::TOLERANCE).div_euclid(self.interval) * self.interval + self.interval;
+            // The first sample comes at once, wherever the grid is. When the grid's next time is
+            // too close after it, that one is left out, so no sample covers a very short span.
+            if std::mem::take(&mut self.first) && self.next - now < self.interval / 2 {
+                self.next += self.interval;
+            }
+        }
+    }
+
+    /// Milliseconds until the next time, when the schedule is running.
+    fn wait(&self, now: i64) -> Option<i64> {
+        (self.interval > 0).then(|| (self.next - now).max(1))
+    }
+}
+
+/// How long after start-up the recording waits before its first sample.
+const RECORD_WARMUP: std::time::Duration = std::time::Duration::from_secs(3);
+
+fn epoch_ms() -> i64 {
+    recorder::unix_ms(filetime_now())
+}
+
+/// Takes a sample whenever the screen or the recording is due, and hands it to those that are.
+fn sample_loop(shared: Arc<Shared>, enrich: Sender<Arc<ImageInfo>>, recording: Option<(i64, SyncSender<recorder::Msg>)>) {
+    let mut s = Sampler::new(shared.clone(), enrich);
+    let (mut screen, mut record) = (Timer::new(), Timer::new());
+    let record_ms = recording.as_ref().map_or(0, |r| r.0);
+    let started = Instant::now();
+    loop {
+        let now = epoch_ms();
+        let minimized = shared.minimized.load(Ordering::Relaxed);
+        let interval = shared.interval_ms.load(Ordering::Relaxed) as i64;
+        // The recording's own needs do not make the screen run.
+        let screen_active = shared.demand.screen(minimized) & need::LIVE != 0;
+        let forced = shared.force.swap(false, Ordering::AcqRel);
+        let screen_due = screen.due(screen_active, interval, now);
+        // The first seconds mostly show this app starting up: the recording begins after them.
+        let warm_left = RECORD_WARMUP.checked_sub(started.elapsed());
+        let record_due = record.due(record_ms > 0 && warm_left.is_none(), record_ms, now);
+        if forced || screen_due || record_due {
+            let snap = Arc::new(s.sample());
+            let done = epoch_ms();
+            if forced || screen_due {
+                screen.served(done);
+                publish(&shared, snap.clone());
+            }
+            if let (true, Some((_, tx))) = (record_due, &recording) {
+                record.served(done);
+                // When the writer is behind, this sample is dropped rather than queued.
+                recorder::offer(tx, recorder::Msg::Sample(snap));
+            }
+        }
+        wait(&shared, &screen, &record, warm_left.filter(|_| record_ms > 0));
+    }
+}
+
+fn publish(shared: &Shared, snap: Arc<Snapshot>) {
+    *shared.slot.lock().unwrap() = Some(snap);
     shared.post(WM_APP_SNAPSHOT);
 }
 
-fn wait(shared: &Shared) {
-    let ms = shared.interval_ms.load(Ordering::Relaxed);
-    let timeout = if ms == 0 { INFINITE } else { ms };
-    unsafe { WaitForSingleObject(shared.wake.load(Ordering::Relaxed) as HANDLE, timeout) };
+/// Sleeps until a schedule is due, or until something wakes the sampler. Without a running
+/// schedule it looks at the demand again after one screen interval, as before.
+fn wait(shared: &Shared, screen: &Timer, record: &Timer, warm_left: Option<std::time::Duration>) {
+    let now = epoch_ms();
+    let base = shared.interval_ms.load(Ordering::Relaxed) as i64;
+    let mut timeout = (base > 0).then_some(base);
+    for t in [screen.wait(now), record.wait(now)].into_iter().flatten() {
+        timeout = Some(timeout.map_or(t, |x| x.min(t)));
+    }
+    if let Some(left) = warm_left {
+        let left = left.as_millis() as i64 + 1;
+        timeout = Some(timeout.map_or(left, |x| x.min(left)));
+    }
+    let ms = timeout.map_or(INFINITE, |t| t.clamp(1, u32::MAX as i64 - 1) as u32);
+    unsafe { WaitForSingleObject(shared.wake.load(Ordering::Relaxed) as HANDLE, ms) };
 }
 
 impl Sampler {
@@ -274,6 +403,7 @@ impl Sampler {
         if !self.query() {
             return snap;
         }
+        snap.taken = filetime_now();
         let now = Instant::now();
         let elapsed_100ns = self
             .last_sample
@@ -316,6 +446,7 @@ impl Sampler {
         // After machine-wide samples the baselines are old, so this one only renews them.
         let stale = std::mem::take(&mut self.procs_stale);
         snap.has_procs = true;
+        snap.stale = stale;
         self.generation += 1;
         let capacity = elapsed_100ns * self.ncpu;
 
@@ -416,6 +547,8 @@ impl Sampler {
                 disk_bps,
                 gpu_util: 0.0,
                 gpu_engine: String::new(),
+                gpu_luid: String::new(),
+                gpu_kind: String::new(),
                 gpu_dedicated: 0,
                 gpu_shared: 0,
                 net_bps: 0,
@@ -460,7 +593,9 @@ impl Sampler {
             for p in snap.procs.iter_mut() {
                 if let Some(g) = proc_gpu.get(&p.pid) {
                     p.gpu_util = g.util;
-                    p.gpu_engine = g.engine.clone();
+                    p.gpu_engine = g.label.clone();
+                    p.gpu_luid = g.luid.clone();
+                    p.gpu_kind = g.kind.clone();
                     p.gpu_dedicated = g.dedicated;
                     p.gpu_shared = g.shared;
                 }
@@ -1065,4 +1200,178 @@ fn premultiply(p: u32) -> u32 {
     let a = p >> 24;
     let scale = |c: u32| (c * a + 127) / 255;
     (a << 24) | (scale((p >> 16) & 255) << 16) | (scale((p >> 8) & 255) << 8) | scale(p & 255)
+}
+
+#[cfg(test)]
+mod schedule_tests {
+    use super::Timer;
+
+    /// Runs a schedule from `from` to `to` (ms) in steps of `step`, and lists when it was due.
+    fn fires(t: &mut Timer, interval: i64, from: i64, to: i64, step: i64) -> Vec<i64> {
+        (from..=to).step_by(step as usize).filter(|now| {
+            let due = t.due(true, interval, *now);
+            if due {
+                t.served(*now);
+            }
+            due
+        }).collect()
+    }
+
+    #[test]
+    fn consumers_keep_their_own_intervals_on_one_grid() {
+        // A 3 s screen and a 5 s recording, polled every 10 ms around the grid times.
+        let (mut screen, mut record) = (Timer::new(), Timer::new());
+        let mut times = Vec::new();
+        for now in (0..=31_000).step_by(10) {
+            let s = screen.due(true, 3000, now);
+            let r = record.due(true, 5000, now);
+            if s || r {
+                times.push((now, s, r));
+                let done = now + 5;
+                if s {
+                    screen.served(done);
+                }
+                if r {
+                    record.served(done);
+                }
+            }
+        }
+        // A schedule may fire up to the tolerance early, so round to whole seconds.
+        let sec = |ms: i64| (ms + 500) / 1000;
+        let at: Vec<i64> = times.iter().map(|t| sec(t.0)).collect();
+        // The first sample is due at once for both; then the grids 3, 6, 9... and 5, 10, 15...
+        assert_eq!(at, vec![0, 3, 5, 6, 9, 10, 12, 15, 18, 20, 21, 24, 25, 27, 30]);
+        // Where both are due (0, 15, 30) one sample serves both.
+        let both: Vec<i64> = times.iter().filter(|t| t.1 && t.2).map(|t| sec(t.0)).collect();
+        assert_eq!(both, vec![0, 15, 30]);
+        // The recording's own gaps are 5 s, give or take the polling.
+        let rec: Vec<i64> = times.iter().filter(|t| t.2).map(|t| t.0).collect();
+        assert!(rec.windows(2).all(|w| (w[1] - w[0] - 5000).abs() <= 40));
+    }
+
+    #[test]
+    fn a_schedule_that_was_late_or_stalled_skips_what_it_missed() {
+        let mut t = Timer::new();
+        assert!(t.due(true, 1000, 5_000));
+        t.served(5_000);
+        // 20 s pass without a check: due once, then back on the grid.
+        assert!(t.due(true, 1000, 25_400));
+        t.served(25_400);
+        assert!(!t.due(true, 1000, 25_500));
+        assert!(t.due(true, 1000, 26_000));
+    }
+
+    #[test]
+    fn a_clock_set_back_does_not_freeze_the_schedule() {
+        let mut t = Timer::new();
+        assert!(t.due(true, 1000, 3_600_000));
+        t.served(3_600_000);
+        // The clock is set back by an hour: due again within one interval, not after an hour.
+        let mut at = None;
+        for now in (0..=2_000).step_by(100) {
+            if t.due(true, 1000, now) {
+                at = Some(now);
+                break;
+            }
+        }
+        assert!(at.is_some_and(|n| n <= 1_000), "{at:?}");
+        // The wait is never longer than the interval either.
+        t.served(1_000);
+        assert!(t.wait(1_000).unwrap() <= 1_000);
+    }
+
+    #[test]
+    fn a_wait_that_ends_a_little_early_still_counts() {
+        let mut t = Timer::new();
+        assert!(t.due(true, 1000, 10_000));
+        t.served(10_010);
+        // Woken 10 ms before the time: due, not pushed to the next second.
+        assert!(!t.due(true, 1000, 10_900));
+        assert!(t.due(true, 1000, 10_990));
+    }
+
+    #[test]
+    fn a_slow_sample_is_not_followed_at_once_by_another() {
+        let mut t = Timer::new();
+        assert!(t.due(true, 500, 0));
+        // The sample took 800 ms. The next time on the grid, 1000, is only 200 ms away, so the
+        // first sample's follower is left out.
+        t.served(800);
+        assert!(!t.due(true, 500, 810));
+        assert!(!t.due(true, 500, 1_000));
+        assert!(t.due(true, 500, 1_500));
+        // After that, a slow sample just goes on to the next time on the grid.
+        t.served(1_900);
+        assert!(!t.due(true, 500, 1_950));
+        assert!(t.due(true, 500, 2_000));
+    }
+
+    #[test]
+    fn the_first_sample_is_not_followed_closely_by_the_second() {
+        // Started 270 ms before a grid time of 5 s: the second sample waits for the next one.
+        let mut t = Timer::new();
+        assert!(t.due(true, 5_000, 14_730));
+        t.served(14_735);
+        assert!(!t.due(true, 5_000, 15_000));
+        assert!(t.due(true, 5_000, 20_000));
+        // Started well before the grid time: the grid time is kept.
+        let mut t = Timer::new();
+        assert!(t.due(true, 5_000, 12_000));
+        t.served(12_005);
+        assert!(t.due(true, 5_000, 15_000));
+    }
+
+    #[test]
+    fn changing_the_interval_or_stopping_restarts_the_schedule() {
+        let mut t = Timer::new();
+        assert_eq!(fires(&mut t, 1000, 0, 3_000, 100), vec![0, 1000, 2000, 3000]);
+        // A new interval waits for its next time on the grid.
+        assert!(!t.due(true, 5000, 3_100));
+        assert!(t.due(true, 5000, 5_000));
+        t.served(5_000);
+        // Not running: never due, and it starts with a sample when it runs again.
+        assert!(!t.due(false, 5000, 6_000));
+        assert!(t.due(true, 5000, 6_100));
+        assert!(!t.due(true, 0, 7_000));
+        assert_eq!(t.wait(7_000), None);
+    }
+}
+
+#[cfg(test)]
+mod recording_tests {
+    use super::*;
+    use crate::system::sqlite::Db;
+    use std::time::Duration;
+
+    /// The whole path with no window: the recording alone is enough to make the sampler run, writes
+    /// every second, and ends its session when the app ends.
+    // It takes about 10 seconds (the recording waits out the start-up), so it only runs on request:
+    // cargo test -- --ignored recording_follows
+    #[test]
+    #[ignore = "takes about 10 seconds"]
+    fn recording_follows_its_plan() {
+        let dir = std::env::temp_dir().join(format!("ltm-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let plan = recorder::Plan {
+            ms: 1000,
+            dir: dir.clone(),
+            cfg: recorder::Cfg { detail: false, gpu: false, days: 1 },
+        };
+        let shared = Shared::new();
+        start(shared.clone(), Some(plan));
+        // Nothing shows the screen; the recording makes the sampler run after the start-up seconds.
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(!dir.exists());
+        std::thread::sleep(Duration::from_millis(6500));
+        let file = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.path()).find(|p| p.extension().is_some_and(|x| x == "db")).unwrap();
+        assert!(file.file_name().unwrap().to_str().unwrap().starts_with("history-v1-"));
+        let open = |sql: &str| Db::open(&file).unwrap().query_i64(sql).unwrap_or(-1);
+        assert!(open("SELECT count(*) FROM sample") >= 2);
+        assert_eq!(open("SELECT count(*) FROM session WHERE ended_at IS NULL"), 1);
+        assert!(open("SELECT count(*) FROM process_sample") > 20);
+        shared.end_recording(false);
+        assert_eq!(open("SELECT count(*) FROM session WHERE ended_at IS NULL"), 0);
+        assert_eq!(open("SELECT count(*) FROM session WHERE end_reason = 'exit'"), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

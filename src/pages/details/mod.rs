@@ -1,10 +1,14 @@
-//! The details page: a virtualized process table.
+//! The process page: the graph of the last minutes on top (see `timeline`), and a
+//! virtualized process table below it. The table shows the processes now, at a moment
+//! picked on the graph, or summed up over a range picked on the graph (see `range`).
 
 pub mod columns;
 pub mod grouping;
 mod input;
 mod paint;
+pub mod range;
 mod rows;
+pub mod timeline;
 
 use super::{Cmd, Cursor, Cx, Ev, Nav, Page};
 use crate::i18n::tr;
@@ -19,6 +23,8 @@ use crate::ui::theme::THEME;
 use crate::ui::widgets::{FLING_DECAY_SECONDS, FLING_STOP_SPEED, SCROLL_EASE_SECONDS, WHEEL_LINES};
 use columns::Col;
 use grouping::{Group, GroupId};
+use range::{RCol, RItem, ROp, RangeData, Which};
+use timeline::Timeline;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::sync::Arc;
@@ -41,22 +47,61 @@ const PICKER_LAYOUTS: [PickerLayout; 3] = [
 ];
 
 /// The width of each panel: its longest label, with room for the checkbox.
-fn picker_panel_widths(c: &mut Canvas, layout: &[&[usize]]) -> Vec<i32> {
+fn picker_panel_widths(c: &mut Canvas, layout: &[&[usize]], groups: &[PickGroup]) -> Vec<i32> {
     layout
         .iter()
-        .map(|groups| {
+        .map(|members| {
             let mut widest = 0;
-            for g in groups.iter() {
-                let (name, members) = columns::GROUPS[*g];
-                widest = widest.max(c.measure(name(tr()), Font::Semi));
-                for col in members.iter() {
-                    widest = widest.max(c.measure(columns::def(*col).full(), Font::Small));
+            for g in members.iter() {
+                let (name, items) = &groups[*g];
+                widest = widest.max(c.measure(name, Font::Semi));
+                for (_, label) in items.iter() {
+                    widest = widest.max(c.measure(label, Font::Small));
                 }
             }
             // Checkbox, the gaps around it, and the right margin.
             widest + c.px(44)
         })
         .collect()
+}
+
+/// A checkbox of a column picker: a column of the process table, or an item or an
+/// operation of the range table.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Pick {
+    Col(Col),
+    Item(RItem),
+    Op(ROp),
+}
+
+/// A heading of a column picker and its checkboxes.
+type PickGroup = (String, Vec<(Pick, String)>);
+
+/// A column of whichever table is shown.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AnyCol {
+    P(Col),
+    R(RCol),
+}
+
+impl AnyCol {
+    fn label(self) -> String {
+        match self {
+            AnyCol::P(c) => columns::def(c).label().to_string(),
+            AnyCol::R(c) => c.label(),
+        }
+    }
+
+    fn right(self) -> bool {
+        match self {
+            AnyCol::P(c) => columns::def(c).right,
+            AnyCol::R(c) => c.right(),
+        }
+    }
+
+    fn is_name(self) -> bool {
+        matches!(self, AnyCol::P(Col::Name) | AnyCol::R(RCol { item: RItem::Name, .. }))
+    }
 }
 
 /// What `DetailsPage::reveal` found.
@@ -119,6 +164,9 @@ enum Act {
     PickColumns,
     ResetColumns,
     HideColumn(Col),
+    /// Range table: hide an item (all its columns), or an operation (of every item).
+    HideItem(RItem),
+    HideOp(ROp),
     View(ViewMode),
 }
 
@@ -147,8 +195,8 @@ enum Overlay {
     },
     Columns {
         hover: Option<usize>,
-        /// Each checkbox's rectangle and the column it toggles.
-        cells: Vec<(Rect, Col)>,
+        /// Each checkbox's rectangle and what it toggles.
+        cells: Vec<(Rect, Pick)>,
         hover_btn: Option<usize>,
         buttons: [Rect; 2],
         panel: Rect,
@@ -167,11 +215,13 @@ enum Drag {
     Header { idx: usize, start_x: i32, x: i32, moving: bool },
     VThumb { offset: i32 },
     HThumb { offset: i32 },
+    /// The border between the graph and the table.
+    Split { start_y: i32, start_h: u16 },
 }
 
 #[derive(Clone, Copy)]
 struct ColBox {
-    col: Col,
+    col: AnyCol,
     x: i32,
     w: i32,
 }
@@ -194,12 +244,29 @@ struct Layout {
     view_btn: Rect,
     expand_btn: Rect,
     collapse_btn: Rect,
+    /// The graph button: its icon part turns the graph on and off, its arrow opens a menu.
+    graph_btn: Rect,
+    graph_arrow: Rect,
+    /// The bar shown while the graph is paused, the graph, and the border below it.
+    bar_area: Rect,
+    graph: Rect,
+    split: Rect,
+    /// The height of the top heading row of the range table (0 for the process table).
+    group_h: i32,
     chevron: i32,
     indent: i32,
 }
 
 pub struct DetailsPage {
+    /// What the table shows: the latest snapshot, a past one, or the processes of a range.
     snap: Arc<Snapshot>,
+    /// The latest snapshot, whatever the table shows.
+    live: Arc<Snapshot>,
+    /// The table shows a past moment or a range, not the latest snapshot.
+    past: bool,
+    /// The range table's values, while a range is shown.
+    range: Option<RangeData>,
+    tl: Timeline,
     sorted: Vec<u32>,
     groups: Vec<Group>,
     in_group: Vec<bool>,
@@ -240,6 +307,9 @@ pub struct DetailsPage {
     hover_aim: bool,
     hover_expand: bool,
     hover_collapse: bool,
+    /// 1 the graph button's icon, 2 its arrow.
+    hover_graph: u8,
+    hover_split: bool,
     /// Aim mode is on (see `crate::app::aim`).
     aiming: bool,
     mouse: (i32, i32),
@@ -256,6 +326,10 @@ impl DetailsPage {
     pub fn new() -> Self {
         Self {
             snap: Arc::new(Snapshot::default()),
+            live: Arc::new(Snapshot::default()),
+            past: false,
+            range: None,
+            tl: Timeline::new(),
             sorted: Vec::new(),
             groups: Vec::new(),
             in_group: Vec::new(),
@@ -292,6 +366,8 @@ impl DetailsPage {
             hover_aim: false,
             hover_expand: false,
             hover_collapse: false,
+            hover_graph: 0,
+            hover_split: false,
             aiming: false,
             mouse: (-1, -1),
             drag: Drag::None,
@@ -377,11 +453,180 @@ impl DetailsPage {
         }
     }
 
-    /// The names the list shows, by PID, for aim mode's label.
+    /// The names of the running processes, by PID, for aim mode's label.
     pub fn names(&self) -> HashMap<u32, String> {
-        self.snap.procs.iter().map(|p| (p.pid, p.stat.name.clone())).collect()
+        self.live.procs.iter().map(|p| (p.pid, p.stat.name.clone())).collect()
     }
 
+    /// Whether a process still runs: the same PID and creation time in the latest snapshot.
+    fn alive(&self, key: (u32, i64)) -> bool {
+        !self.past || self.live.procs.iter().any(|p| p.key() == key)
+    }
+
+    /// The columns of the table shown, with their widths.
+    fn shown_columns(&self, s: &Settings) -> Vec<(AnyCol, u16)> {
+        if self.range.is_some() {
+            range::visible(&s.range_items, s.range_ops).into_iter().map(|(c, w)| (AnyCol::R(c), w)).collect()
+        } else {
+            s.columns.iter().map(|(c, w)| (AnyCol::P(*c), *w)).collect()
+        }
+    }
+
+    /// Back to the latest snapshot, for whatever acts on running processes (showing one
+    /// from another page, aim mode).
+    pub fn go_live(&mut self, s: &Settings) {
+        if self.tl.resume() || self.past {
+            self.show_selection(s);
+        }
+    }
+
+    /// Shows what the graph's selection asks for: the latest snapshot, a past moment, or a range.
+    fn show_selection(&mut self, s: &Settings) {
+        self.born.clear();
+        self.ghosts.clear();
+        self.range = None;
+        match self.tl.selection() {
+            None => {
+                self.past = false;
+                self.snap = self.live.clone();
+                // The next update marks nothing as started or ended: the gap is unknown.
+                self.prev_at = None;
+            }
+            Some([one]) => {
+                self.past = true;
+                self.snap = Arc::new(self.tl.snapshot(one));
+            }
+            Some(samples) => {
+                self.past = true;
+                let items: Vec<RItem> = s.range_items.iter().map(|(i, _)| *i).collect();
+                let (data, procs) = RangeData::build(samples, &items, |r| self.tl.unpack(r));
+                let last = samples.last().expect("a range has samples");
+                self.snap = Arc::new(Snapshot {
+                    taken: last.time,
+                    stale: false,
+                    procs,
+                    has_procs: true,
+                    cpu_total: last.cpu,
+                    mem_total: last.mem_total,
+                    mem_used: last.mem_used,
+                    sys: Default::default(),
+                });
+                self.range = Some(data);
+            }
+        }
+        self.haystacks.clear();
+        self.regroup(s);
+        if let Some(i) = self.selected_index() {
+            self.select_index(i);
+        }
+    }
+
+    /// What the graph or its dialogs asked for.
+    fn after_timeline(&mut self, out: timeline::Out, cx: &mut Cx) {
+        match out {
+            timeline::Out::Selection => {
+                self.show_selection(cx.settings);
+                *cx.dirty = true;
+            }
+            timeline::Out::ExportChanged => self.refresh_estimate(cx.settings),
+            timeline::Out::ExportStart => {
+                if let Some(job) = self.tl.export.as_ref().and_then(|d| self.export_job(cx.settings, d.choices())) {
+                    self.tl.save(job, cx);
+                }
+            }
+            timeline::Out::Pass | timeline::Out::Taken => {}
+        }
+    }
+
+    /// Works out the file size for the export dialog's choices, when they changed.
+    fn refresh_estimate(&mut self, s: &Settings) {
+        let Some(d) = &self.tl.export else { return };
+        let key = d.choices();
+        if d.estimate.is_some_and(|(k, _)| k == key) {
+            return;
+        }
+        let size = self.export_job(s, key).map_or(0, |j| j.estimate());
+        if let Some(d) = &mut self.tl.export {
+            d.estimate = Some((key, size));
+        }
+    }
+
+    /// What to write, taken from what the page shows now.
+    fn export_job(&self, s: &Settings, choices: (timeline::Scope, timeline::export::Kind, timeline::export::Format, timeline::export::Encoding)) -> Option<timeline::export::Job> {
+        use timeline::{export, Scope};
+        let (scope, kind, format, encoding) = choices;
+        let range = match scope {
+            Scope::Selection => self.tl.selection()?.to_vec(),
+            Scope::All => self.tl.all().to_vec(),
+        };
+        if range.is_empty() {
+            return None;
+        }
+        let table = match kind {
+            export::Kind::Table if scope == Scope::All => self.whole_table(&range, s),
+            export::Kind::Table => self.table_dump(s),
+            _ => export::Table { head: Vec::new(), rows: Vec::new() },
+        };
+        let adapters = self.tl.shown_adapters().into_iter().map(|(i, rank)| (i, rank, self.tl.adapters[i].total)).collect();
+        let mut disks: Vec<(u32, usize)> = self.tl.disks.iter().enumerate().filter_map(|(i, d)| Some((d.id.parse().ok()?, i))).collect();
+        disks.sort_unstable();
+        Some(export::Job { kind, format, encoding, range, table, terms: self.filter.clone(), offset: self.tl.offset, disks, adapters })
+    }
+}
+
+/// The name of a column in exported files: snake_case, the unit at the end.
+fn export_name(col: AnyCol) -> String {
+    match col {
+        AnyCol::P(c) => match c {
+            Col::Cpu => "cpu_ratio".into(),
+            Col::GpuUsage => "gpu_ratio".into(),
+            Col::CpuTime => "cpu_time_seconds".into(),
+            Col::MemActivePct | Col::MemPrivatePct | Col::DiskPct | Col::NetPct => format!("{}_ratio", columns::def(c).key),
+            Col::DiskRate | Col::Network => format!("{}_bytes_per_second", columns::def(c).key),
+            Col::WsDelta
+            | Col::ActivePrivate
+            | Col::Private
+            | Col::Ws
+            | Col::PeakWs
+            | Col::SharedWs
+            | Col::Commit
+            | Col::Paged
+            | Col::NonPaged
+            | Col::IoReadBytes
+            | Col::IoWriteBytes
+            | Col::IoOtherBytes
+            | Col::GpuDedicated
+            | Col::GpuShared => format!("{}_bytes", columns::def(c).key),
+            _ => columns::def(c).key.to_string(),
+        },
+        AnyCol::R(c) => {
+            let unit = match c.item {
+                RItem::Cpu | RItem::Gpu => "_ratio",
+                RItem::Disk | RItem::Network => "_bytes_per_second",
+                RItem::Faults => "_per_second",
+                RItem::CpuTime | RItem::Hung => "_seconds",
+                RItem::Mem
+                | RItem::Private
+                | RItem::Ws
+                | RItem::Commit
+                | RItem::Paged
+                | RItem::NonPaged
+                | RItem::GpuMem
+                | RItem::GpuShared
+                | RItem::IoReadBytes
+                | RItem::IoWriteBytes
+                | RItem::IoOtherBytes => "_bytes",
+                _ => "",
+            };
+            match c.op {
+                ROp::None => format!("{}{unit}", c.item.key()),
+                op => format!("{}_{}{unit}", c.item.key(), op.key()),
+            }
+        }
+    }
+}
+
+impl DetailsPage {
     pub fn set_aiming(&mut self, on: bool) {
         self.aiming = on;
     }
@@ -409,8 +654,26 @@ fn fill_cell(col: Col, p: &Proc, members: Option<usize>, scale: &columns::Scale,
 }
 
 impl Page for DetailsPage {
-    fn demand(&self, settings: &Settings) -> crate::system::demand::Needs {
-        crate::system::demand::Needs { shown: crate::system::demand::need::PROCS | columns::demand(&settings.columns), always: 0 }
+    /// While the graph is on it records wherever the user is, minimized too: the machine,
+    /// the processes, and what the shown columns need, so that the past has them too.
+    fn demand(&self, s: &Settings) -> crate::system::demand::Needs {
+        use crate::system::demand::need;
+        let cols = columns::demand(&s.columns);
+        let always = if s.tm_enabled {
+            let gpu = timeline::target::targets(s).iter().any(|t| t.uses_gpu());
+            let items = s.range_items.iter().fold(0, |n, (i, _)| {
+                n | match i {
+                    RItem::Gpu | RItem::GpuMem | RItem::GpuShared => need::PROC_GPU,
+                    RItem::Network => need::PROC_NET,
+                    RItem::UserObjects | RItem::GdiObjects => need::GUI_COUNTS,
+                    _ => 0,
+                }
+            });
+            need::SYS | need::PROCS | cols | items | if gpu { need::SYS_GPU | need::PROC_GPU } else { 0 }
+        } else {
+            0
+        };
+        crate::system::demand::Needs { shown: need::PROCS | cols, always }
     }
 
     fn nav(&self) -> Nav {
@@ -431,7 +694,14 @@ impl Page for DetailsPage {
         *cx.dirty = true;
     }
 
+    fn captures_text(&self) -> bool {
+        self.tl.captures_text()
+    }
+
     fn on_snapshot(&mut self, snap: &Arc<Snapshot>, cx: &mut Cx) {
+        if self.tl.wants(snap, cx.settings) {
+            self.tl.record(snap, cx.settings);
+        }
         if !snap.has_procs {
             return;
         }
@@ -459,8 +729,13 @@ impl Page for DetailsPage {
         self.scroll_y != self.target_y || self.fling != (0.0, 0.0)
     }
 
+    fn on_hide(&mut self, _cx: &mut Cx) {
+        self.drag = Drag::None;
+    }
+
     fn pannable(&self, x: i32, y: i32) -> bool {
         matches!(self.overlay, Overlay::None)
+            && !self.tl.overlay_open()
             && self.l.body.contains(x, y)
             && !self.vthumb().is_some_and(|t| t.contains(x, y))
             && !self.hthumb().is_some_and(|t| t.contains(x, y))
@@ -469,6 +744,8 @@ impl Page for DetailsPage {
     fn cursor(&self) -> Cursor {
         if self.hover_edge || matches!(self.drag, Drag::Resize { .. }) {
             Cursor::SizeWE
+        } else if self.hover_split || matches!(self.drag, Drag::Split { .. }) {
+            Cursor::SizeNS
         } else {
             Cursor::Arrow
         }
@@ -478,8 +755,27 @@ impl Page for DetailsPage {
         if let Ev::Move { x, y } = *ev {
             self.mouse = (x, y);
         }
+        // The graph's dialogs and menus first, then the table's.
+        let out = self.tl.overlay_event(ev, cx);
+        if out != timeline::Out::Pass {
+            return self.after_timeline(out, cx);
+        }
         if !matches!(ev, Ev::Tick { .. }) && self.overlay_event(ev, cx) {
             return;
+        }
+        // The graph and the paused bar take what happens over them; a move goes to both.
+        let to_graph = match *ev {
+            Ev::Move { .. } | Ev::Leave | Ev::Up { .. } => true,
+            Ev::Down { x, y, .. } => self.l.graph.contains(x, y) || self.l.bar_area.contains(x, y),
+            Ev::Wheel { .. } => self.tl.over_plot(self.mouse.0, self.mouse.1),
+            Ev::Key { vk: VK_ESCAPE, .. } => true,
+            _ => false,
+        };
+        if to_graph && self.drag == Drag::None {
+            let out = self.tl.event(ev, cx);
+            if !matches!(ev, Ev::Move { .. } | Ev::Leave) && out != timeline::Out::Pass {
+                return self.after_timeline(out, cx);
+            }
         }
         match *ev {
             Ev::Move { x, y } => self.on_mouse_move(x, y, cx),
@@ -539,9 +835,24 @@ impl Page for DetailsPage {
     fn paint(&mut self, c: &mut Canvas, area: Rect, settings: &Settings) {
         self.layout(c, area, settings);
         self.paint_toolbar(c, settings);
+        if settings.tm_enabled {
+            self.tl.paint_bar(c, self.l.bar_area);
+            self.tl.paint_graph(c, self.l.graph, settings);
+            if self.hover_split || matches!(self.drag, Drag::Split { .. }) {
+                let s = self.l.split;
+                let w = c.px(40);
+                c.round(rect(s.x + (s.w - w) / 2, s.y + s.h / 2 - 1, w, c.px(3)), 1.5, THEME.text_faint, 255);
+            }
+        }
         self.paint_header(c, settings);
         self.paint_rows(c);
+        if self.range.is_some() {
+            self.paint_time_tip(c);
+        }
+        // Over the table: the tooltip sits below the pointer and may run past the graph.
+        self.tl.paint_hover(c, area, settings);
         self.paint_overlay(c, settings);
+        self.tl.paint_overlays(c, area, settings);
     }
 }
 
@@ -588,6 +899,8 @@ impl DetailsPage {
         procs.push(fresh);
         let old = &self.snap;
         let snap = Arc::new(Snapshot {
+            taken: old.taken,
+            stale: old.stale,
             procs,
             has_procs: true,
             cpu_total: old.cpu_total,
@@ -600,5 +913,104 @@ impl DetailsPage {
 
     pub fn resort_for_test(&mut self, settings: &Settings) {
         self.resort(settings);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::timeline::export::{Encoding, Format, Kind};
+    use super::timeline::tests::{proc_of, rec};
+    use super::timeline::Scope;
+    use super::*;
+
+    /// A page that recorded three snapshots: 1 runs throughout, 2 ends, 3 starts.
+    fn recorded(s: &Settings) -> DetailsPage {
+        let mut page = DetailsPage::new();
+        for pids in [&[1u32, 2][..], &[1, 2], &[1, 3]] {
+            let mut snap = Snapshot { has_procs: true, procs: pids.iter().map(|p| proc_of(&rec(*p, *p as f32, 100 * *p))).collect(), ..Default::default() };
+            snap.sys.elapsed = 1.0;
+            let snap = Arc::new(snap);
+            page.tl.record(&snap, s);
+            page.live = snap;
+        }
+        page
+    }
+
+    fn csv(page: &DetailsPage, s: &Settings, scope: Scope, kind: Kind) -> Vec<String> {
+        let job = page.export_job(s, (scope, kind, Format::Csv, Encoding::Utf8Bom)).expect("a job");
+        let mut buf = Vec::new();
+        job.write(&mut buf).unwrap();
+        String::from_utf8(buf[3..].to_vec()).unwrap().split("\r\n").filter(|l| !l.is_empty()).map(String::from).collect()
+    }
+
+    #[test]
+    fn a_picked_time_shows_that_moment_and_ends_only_what_still_runs() {
+        let s = Settings::default();
+        let mut page = recorded(&s);
+        page.tl.select_for_test(0, 0, &s);
+        page.show_selection(&s);
+        assert!(page.past && page.range.is_none());
+        let pids: Vec<u32> = page.snap.procs.iter().map(|p| p.pid).collect();
+        assert_eq!(pids, [1, 2]);
+        // 2 has ended since: it is shown but cannot be ended.
+        assert!(page.alive(page.snap.procs[0].key()));
+        assert!(!page.alive(page.snap.procs[1].key()));
+        // Showing a running process (from another page, or aim mode) goes back to live first:
+        // 3 started after the picked time.
+        assert_eq!(page.reveal(3), Reveal::Missing);
+        page.go_live(&s);
+        assert!(!page.past && page.snap.procs.iter().any(|p| p.pid == 3));
+        assert_eq!(page.reveal(3), Reveal::Shown);
+    }
+
+    #[test]
+    fn exports_of_a_range() {
+        let s = Settings { view: ViewMode::Flat, ..Default::default() };
+        let mut page = recorded(&s);
+        page.tl.select_for_test(0, 2, &s);
+        page.show_selection(&s);
+        assert!(page.range.is_some());
+
+        // The range table as shown: the default items and operations, heaviest CPU first.
+        let table = csv(&page, &s, Scope::Selection, Kind::Table);
+        assert_eq!(table[0], "name,pid,mark,time,cpu_start_ratio,cpu_end_ratio,cpu_delta_ratio,cpu_avg_ratio,cpu_max_ratio,mem_start_bytes,mem_end_bytes,mem_delta_bytes,mem_avg_bytes,mem_max_bytes");
+        assert!(table[1].starts_with("p3,3,+,"));
+        assert!(table[2].starts_with("p2,2,-,"));
+        assert!(table[3].starts_with("p1,1,,,0.01,0.01,0,0.01,0.01,1048576,"));
+        assert_eq!(table.len(), 4);
+        // The whole record summed up, the same way.
+        assert_eq!(csv(&page, &s, Scope::All, Kind::Table), table);
+        // Each process at each sample, and the machine at each sample.
+        assert_eq!(csv(&page, &s, Scope::Selection, Kind::Process).len(), 1 + 6);
+        assert_eq!(csv(&page, &s, Scope::Selection, Kind::System).len(), 1 + 3);
+    }
+
+    #[test]
+    fn a_picked_time_exports_the_shown_columns_without_private_ones() {
+        let s = Settings { columns: vec![(Col::Name, 200), (Col::User, 100), (Col::Cpu, 60), (Col::ActivePrivate, 100)], ..Default::default() };
+        let mut page = recorded(&s);
+        page.tl.select_for_test(2, 2, &s);
+        page.show_selection(&s);
+        let table = csv(&page, &s, Scope::Selection, Kind::Table);
+        // No user name; the CPU as a ratio, memory in bytes.
+        assert_eq!(table[0], "name,cpu_ratio,active_bytes");
+        assert_eq!(table.len(), 3);
+        assert!(table.contains(&"p3,0.03,1048576".to_string()));
+    }
+
+    #[test]
+    fn while_on_it_reads_what_the_shown_columns_need() {
+        use crate::system::demand::need;
+        let mut s = Settings { columns: vec![(Col::Name, 200), (Col::GpuUsage, 70)], ..Default::default() };
+        let page = DetailsPage::new();
+        let d = page.demand(&s);
+        assert_eq!(d.always & (need::PROCS | need::PROC_GPU), need::PROCS | need::PROC_GPU);
+        // The range table's items count too.
+        s.columns = columns::defaults();
+        s.range_items.push((RItem::Network, 80));
+        assert_ne!(page.demand(&s).always & need::PROC_NET, 0);
+        // Off, it reads nothing while not shown.
+        s.tm_enabled = false;
+        assert_eq!(page.demand(&s).always, 0);
     }
 }
