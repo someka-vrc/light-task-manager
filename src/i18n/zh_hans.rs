@@ -338,6 +338,7 @@ pub static STRINGS: Strings = Strings {
         reg_32: "注册表(32 位)",
         folder: "启动文件夹",
         folder_common: "启动文件夹(所有用户)",
+        packaged: "打包应用",
         empty: "没有启动应用",
         change_failed: |name, err| format!("无法更改 {name}。{err}"),
         open_folder: "打开启动文件夹",

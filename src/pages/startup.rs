@@ -1,6 +1,8 @@
 //! The startup apps page: programs started at sign-in from the Run keys and
 //! the Startup folders, enabled or disabled the same way Windows does it
-//! (the Explorer\StartupApproved keys).
+//! (the Explorer\StartupApproved keys), plus the startup tasks of packaged apps.
+
+mod packaged;
 
 use super::{Cx, Ev, Nav, Page};
 use crate::i18n::{tr, Text};
@@ -54,10 +56,26 @@ struct Item {
     location: Text,
     enabled: bool,
     publisher: String,
-    approved_root: HKEY,
-    approved_key: String,
-    value: String,
+    toggle: Toggle,
     image: Option<Arc<ImageInfo>>,
+}
+
+/// Where the enabled flag lives.
+#[derive(Clone)]
+enum Toggle {
+    /// A value under Explorer\StartupApproved\{key}.
+    Approved { root: HKEY, key: String, value: String },
+    /// A packaged app's startup task (`<family>\<task id>`).
+    Packaged(String),
+}
+
+impl Toggle {
+    fn set(&self, enable: bool) -> Result<(), u32> {
+        match self {
+            Toggle::Approved { root, key, value } => set_approved(*root, key, value, enable),
+            Toggle::Packaged(key) => packaged::set_enabled(key, enable),
+        }
+    }
 }
 
 fn expand(s: &str) -> String {
@@ -163,9 +181,7 @@ fn run_key(out: &mut Vec<Item>, root: HKEY, sub: &str, location: Text, approved_
                 location,
                 enabled: approved(root, approved_key, &value),
                 publisher: String::new(),
-                approved_root: root,
-                approved_key: approved_key.to_string(),
-                value,
+                toggle: Toggle::Approved { root, key: approved_key.to_string(), value },
                 image: None,
             });
         }
@@ -373,9 +389,7 @@ fn folder(out: &mut Vec<Item>, id: &windows_sys::core::GUID, root: HKEY, locatio
             location,
             enabled: approved(root, "StartupFolder", &file),
             publisher: String::new(),
-            approved_root: root,
-            approved_key: "StartupFolder".into(),
-            value: file,
+            toggle: Toggle::Approved { root, key: "StartupFolder".into(), value: file },
             image: None,
         });
     }
@@ -388,9 +402,26 @@ fn collect(icon_px: i32) -> Vec<Item> {
     run_key(&mut out, HKEY_LOCAL_MACHINE, RUN32, |s| s.startup.reg_32, "Run32");
     folder(&mut out, &FOLDERID_Startup, HKEY_CURRENT_USER, |s| s.startup.folder);
     folder(&mut out, &FOLDERID_CommonStartup, HKEY_LOCAL_MACHINE, |s| s.startup.folder_common);
+    for t in packaged::tasks() {
+        let location: Text = |s| s.startup.packaged;
+        out.push(Item {
+            id: fnv(&format!("{}\u{1}{}", location(crate::i18n::Lang::En.strings()), t.key)),
+            name: t.name,
+            command: if t.exe.contains(' ') { format!("\"{}\"", t.exe) } else { t.exe.clone() },
+            path: t.exe,
+            location,
+            enabled: t.enabled,
+            publisher: t.publisher,
+            toggle: Toggle::Packaged(t.key),
+            image: None,
+        });
+    }
     for it in &mut out {
         let w = wide(&it.path);
-        it.publisher = version_string(&w, "CompanyName");
+        let company = version_string(&w, "CompanyName");
+        if !company.is_empty() {
+            it.publisher = company;
+        }
         let description = version_string(&w, "FileDescription");
         let info = ImageInfo { path: it.path.clone(), description: OnceLock::new(), company: OnceLock::new(), icon: OnceLock::new() };
         let _ = info.description.set(Arc::from(description));
@@ -471,7 +502,7 @@ impl StartupPage {
         let Some(it) = self.selected().cloned() else { return };
         match act {
             ACT_TOGGLE => {
-                match set_approved(it.approved_root, &it.approved_key, &it.value, !it.enabled) {
+                match it.toggle.set(!it.enabled) {
                     Ok(()) => self.refresh(cx),
                     Err(e) => cx.cmds.push(super::Cmd::Toast((tr().startup.change_failed)(&it.name, &error_text(e)))),
                 }

@@ -338,6 +338,7 @@ pub static STRINGS: Strings = Strings {
         reg_32: "레지스트리(32비트)",
         folder: "시작 폴더",
         folder_common: "시작 폴더(모든 사용자)",
+        packaged: "패키지 앱",
         empty: "시작 앱이 없습니다",
         change_failed: |name, err| format!("{name}을(를) 변경할 수 없습니다. {err}"),
         open_folder: "시작 폴더 열기",

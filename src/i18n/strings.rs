@@ -374,6 +374,7 @@ pub struct Startup {
     pub reg_32: &'static str,
     pub folder: &'static str,
     pub folder_common: &'static str,
+    pub packaged: &'static str,
     pub empty: &'static str,
     pub change_failed: fn(&str, &str) -> String,
     pub open_folder: &'static str,

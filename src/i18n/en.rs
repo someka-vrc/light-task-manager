@@ -338,6 +338,7 @@ pub static STRINGS: Strings = Strings {
         reg_32: "Registry (32-bit)",
         folder: "Startup folder",
         folder_common: "Startup folder (all users)",
+        packaged: "Packaged app",
         empty: "No startup apps",
         change_failed: |name, err| format!("Could not change {name}. {err}"),
         open_folder: "Open startup folder",

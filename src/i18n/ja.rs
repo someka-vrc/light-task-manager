@@ -338,6 +338,7 @@ pub static STRINGS: Strings = Strings {
         reg_32: "レジストリ (32 ビット)",
         folder: "スタートアップ フォルダー",
         folder_common: "スタートアップ フォルダー (共通)",
+        packaged: "パッケージ アプリ",
         empty: "スタートアップ アプリはありません",
         change_failed: |name, err| format!("{name} を変更できませんでした。{err}"),
         open_folder: "スタートアップ フォルダーを開く",
