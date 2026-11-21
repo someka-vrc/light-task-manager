@@ -301,6 +301,20 @@ A number after the page takes that many more samples before writing (for checkin
 `click=x,y`, `rclick=x,y`, `drag=x1,y1,x2,y2`, `move=x,y`, `zoom=x,y,notches` (`Ctrl` + wheel), `wheel=x,y,dx,dy`, `key=virtual key code`, `type=text` and `filter=search text` replay that input before writing.
 `--shot` uses the default columns, so the column settings are not applied.
 
+### Releasing
+
+1. Raise `version` in `Cargo.toml`, build once so `Cargo.lock` follows, and commit.
+2. Squash-merge into `main`. The commit's first line is the version (`v1.2.3`); the rest becomes the release notes.
+3. Tag it (`git tag -a v1.2.3 -m v1.2.3`) and push `main` and the tag.
+
+Pushing the tag runs `.github/workflows/release.yml`. It checks that the version matches the tag, then tests and builds with the compiler pinned in `rust-toolchain.toml` and the dependencies in `Cargo.lock` (`--locked`). It records a signed build provenance attestation for the executable and publishes the release with the executable attached and its SHA-256 in the notes. It can also be run by hand from the Actions tab for a tag already pushed. It stops if the release already exists.
+
+To check that a downloaded executable is the one built from the tagged source:
+
+```powershell
+gh attestation verify LightTaskManager.exe --repo someka-vrc/light-task-manager
+```
+
 ## License
 
 [MIT License](LICENSE). The licenses of the third-party code built into the executable are in [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt), and in the app under "Open source licenses" at the bottom of the Settings page. When `Cargo.lock` gains a dependency that ends up in the executable, add its notice to THIRD-PARTY-NOTICES.txt.

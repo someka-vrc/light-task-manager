@@ -1,3 +1,6 @@
 [toolchain]
-channel = "stable-x86_64-pc-windows-msvc"
+# Pinned so that local builds and the release workflow use the same compiler. Raise it on purpose.
+channel = "1.99.1"
+targets = ["x86_64-pc-windows-msvc"]
 profile = "minimal"
+components = ["clippy", "rustfmt"]

@@ -301,6 +301,20 @@ UI に出す文字列はコードに書かず、`src/i18n` に置きます。コ
 `click=x,y`、`rclick=x,y`、`drag=x1,y1,x2,y2`、`move=x,y`、`zoom=x,y,ノッチ数`（`Ctrl` + ホイール）、`wheel=x,y,dx,dy`、`key=仮想キーコード`、`type=文字列`、`filter=検索語` を付けると、書き出す前にその操作を再現します。
 `--shot` は既定の列で書き出すため、列の設定は反映されません。
 
+### リリース
+
+1. `Cargo.toml` の `version` を上げ、一度ビルドして `Cargo.lock` を追従させてからコミットします。
+2. `main` にスカッシュマージします。コミットの1行目は版（`v1.2.3`）にし、2行目以降がリリースノートになります。
+3. タグを付け（`git tag -a v1.2.3 -m v1.2.3`）、`main` とタグをプッシュします。
+
+タグをプッシュすると `.github/workflows/release.yml` が動きます。版とタグが一致するかを確かめてから、`rust-toolchain.toml` で固定したコンパイラと `Cargo.lock` の依存（`--locked`）でテストとビルドを行い、実行ファイルのビルドの来歴（署名付きの attestation）を記録して、実行ファイルを添付したリリースを作ります。リリースノートには実行ファイルの SHA-256 も載せます。プッシュ済みのタグに対して、Actions のタブから手動でも実行できます。同じ版のリリースがすでにあるときは止まります。
+
+ダウンロードした実行ファイルが、タグのソースからビルドされたものかを確かめるには:
+
+```powershell
+gh attestation verify LightTaskManager.exe --repo someka-vrc/light-task-manager
+```
+
 ## ライセンス
 
 [MIT License](LICENSE) です。実行ファイルに含まれる他者のコードのライセンスは [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt) にあり、アプリでは設定ページの最下部の「オープンソース ライセンス」から見られます。実行ファイルに入る依存を `Cargo.lock` に足したときは、その表示を THIRD-PARTY-NOTICES.txt に追加してください。
