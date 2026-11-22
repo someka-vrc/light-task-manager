@@ -1,4 +1,5 @@
-//! Headless developer tools: `--bench <out.txt>` and `--shot <out.bmp> [page] [expand] [extra samples]`.
+//! Headless developer tools: `--bench <out.txt>`, `--shot <out.bmp> [page] [expand] [extra samples]`
+//! and `--tray-icons <out.bmp>`.
 
 use crate::app::core::Core;
 use crate::settings::Settings;
@@ -128,6 +129,77 @@ pub fn bench(path: &str) {
 
     let _ = std::fs::write(path, out);
     std::process::exit(0);
+}
+
+/// Writes the notification area icons to a BMP, to judge how they look: one row per icon size,
+/// the plain icon and the bar graph at a few levels, on a dark and on a light taskbar, each
+/// at its real size and then enlarged.
+pub fn tray_icons(path: &str) {
+    use crate::app::icon::{app_pixels, bar_heights, graph_pixels, Levels};
+    const ZOOM: i32 = 6;
+    const SIZES: [i32; 4] = [16, 20, 24, 32];
+    let levels = [
+        None,
+        Some(Levels { cpu: 0.0, mem: 0.0, gpu: None }),
+        Some(Levels { cpu: 3.0, mem: 45.0, gpu: Some(8.0) }),
+        Some(Levels { cpu: 60.0, mem: 75.0, gpu: None }),
+        Some(Levels { cpu: 100.0, mem: 100.0, gpu: Some(100.0) }),
+    ];
+    let backgrounds = [0x202020u32, 0xF3F3F3];
+    let cell = 32 * ZOOM + 16;
+    let real = 48;
+    let cols = 1 + levels.len() as i32;
+    let w = backgrounds.len() as i32 * cols * (cell + real);
+    let h = SIZES.len() as i32 * (cell + 8);
+    let mut img = vec![0u32; (w * h) as usize];
+    for (bi, bg) in backgrounds.iter().enumerate() {
+        let x0 = bi as i32 * cols * (cell + real);
+        for x in x0..x0 + cols * (cell + real) {
+            for y in 0..h {
+                img[(y * w + x) as usize] = *bg;
+            }
+        }
+        for (si, size) in SIZES.iter().enumerate() {
+            for col in 0..cols {
+                let px = if col == 0 { app_pixels(*size) } else { graph_pixels(*size, bar_heights(levels[col as usize - 1], *size)) };
+                let (cx, cy) = (x0 + col * (cell + real), si as i32 * (cell + 8) + 8);
+                // Premultiplied pixels over the background.
+                let over = |src: u32, dst: u32| {
+                    let a = src >> 24;
+                    let ch = |s: u32| (((src >> s) & 255) + ((dst >> s) & 255) * (255 - a) / 255).min(255) << s;
+                    ch(16) | ch(8) | ch(0)
+                };
+                for y in 0..*size {
+                    for x in 0..*size {
+                        let p = px[(y * size + x) as usize];
+                        let at = ((cy + y) * w + cx + 8 + x) as usize;
+                        img[at] = over(p, img[at]);
+                        for dy in 0..ZOOM {
+                            for dx in 0..ZOOM {
+                                let at = ((cy + y * ZOOM + dy) * w + cx + real + x * ZOOM + dx) as usize;
+                                img[at] = over(p, img[at]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(img.len() * 4 + 54);
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&((img.len() * 4 + 54) as u32).to_le_bytes());
+    out.extend_from_slice(&[0; 4]);
+    out.extend_from_slice(&54u32.to_le_bytes());
+    out.extend_from_slice(&40u32.to_le_bytes());
+    out.extend_from_slice(&w.to_le_bytes());
+    out.extend_from_slice(&(-h).to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&32u16.to_le_bytes());
+    out.extend_from_slice(&[0; 24]);
+    for p in img {
+        out.extend_from_slice(&(p | 0xFF000000).to_le_bytes());
+    }
+    let _ = std::fs::write(path, out);
 }
 
 pub fn shot(args: &[String]) {

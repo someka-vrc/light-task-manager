@@ -102,6 +102,9 @@ pub struct App {
     pub exported: fn(&str) -> String,
     pub export_failed: fn(&str) -> String,
     pub filter_cue: &'static str,
+    /// The menu of the icon in the notification area.
+    pub tray_show: &'static str,
+    pub tray_exit: &'static str,
 }
 
 /// The processes page.
@@ -451,6 +454,11 @@ pub struct Settings {
     pub copy_format: &'static str,
     pub copy_scope: &'static str,
     pub elevate_on_start: &'static str,
+    /// Keeping an icon in the notification area, and what the close button then does.
+    pub tray: &'static str,
+    pub tray_note: &'static str,
+    /// The bar graph in that icon.
+    pub tray_graph: &'static str,
     pub lifetime: &'static str,
     pub lifetime_note: &'static str,
     pub privileges: &'static str,

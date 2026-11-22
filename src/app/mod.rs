@@ -2,8 +2,10 @@
 
 pub mod aim;
 pub mod core;
+pub mod icon;
 pub mod instance;
 pub mod pointer;
+pub mod tray;
 pub mod window;
 
 pub use window::run;

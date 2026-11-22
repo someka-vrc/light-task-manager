@@ -80,6 +80,8 @@ pub static STRINGS: Strings = Strings {
         exported: |path| format!("내보냈습니다: {path}"),
         export_failed: |err| format!("내보낼 수 없습니다: {err}"),
         filter_cue: "이름, PID, 사용자 이름, 설명으로 필터링",
+        tray_show: "표시",
+        tray_exit: "종료",
     },
     details: Details {
         title: "프로세스",
@@ -409,6 +411,9 @@ pub static STRINGS: Strings = Strings {
         copy_format: "복사 형식",
         copy_scope: "복사할 속성",
         elevate_on_start: "시작할 때 관리자로 실행",
+        tray: "알림 영역에 상주",
+        tray_note: "닫기 버튼을 누르면 알림 영역으로 숨깁니다.",
+        tray_graph: "알림 영역 아이콘에 그래프 표시",
         lifetime: "프로세스 생성 및 종료",
         lifetime_note: "새로 생성되거나 종료된 프로세스를 잠시 강조 표시합니다",
         privileges: "현재 상태",

@@ -634,8 +634,8 @@ fn rows(open: &mut Open, snap: &Snapshot, cfg: Cfg, session: i64, ts: i64) -> Re
         st.bind_opt_f64(25, cfg.gpu.then_some(p.gpu_util as f64 / 100.0));
         st.bind_opt_i64(26, cfg.gpu.then_some(p.gpu_dedicated as i64));
         st.bind_opt_i64(27, cfg.gpu.then_some(p.gpu_shared as i64));
-        st.bind_opt_text(28, Some(p.gpu_luid.as_str()).filter(|_| cfg.gpu).filter(|v| !v.is_empty()));
-        st.bind_opt_text(29, Some(p.gpu_kind.as_str()).filter(|_| cfg.gpu).filter(|v| !v.is_empty()));
+        st.bind_opt_text(28, cfg.gpu.then_some(p.gpu_luid.as_str()).filter(|v| !v.is_empty()));
+        st.bind_opt_text(29, cfg.gpu.then_some(p.gpu_kind.as_str()).filter(|v| !v.is_empty()));
         st.bind_i64(30, (p.status == Status::NotResponding) as i64);
         run(st)?;
     }

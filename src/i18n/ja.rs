@@ -80,6 +80,8 @@ pub static STRINGS: Strings = Strings {
         exported: |path| format!("エクスポートしました: {path}"),
         export_failed: |err| format!("エクスポートできませんでした: {err}"),
         filter_cue: "名前、PID、ユーザー名、説明で絞り込み",
+        tray_show: "表示",
+        tray_exit: "終了",
     },
     details: Details {
         title: "プロセス",
@@ -409,6 +411,9 @@ pub static STRINGS: Strings = Strings {
         copy_format: "コピーの書式",
         copy_scope: "コピーするプロパティ",
         elevate_on_start: "起動時に管理者として起動する",
+        tray: "タスクトレイに常駐する",
+        tray_note: "閉じるボタンでトレイに格納します。",
+        tray_graph: "トレイアイコンにグラフを表示する",
         lifetime: "プロセスの生成と破棄",
         lifetime_note: "生成/破棄されたプロセスをしばらくの間強調表示します",
         privileges: "現在の状態",

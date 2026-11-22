@@ -39,6 +39,8 @@ fn choice_label(choice: Option<Lang>) -> &'static str {
 enum Id {
     Language,
     Speed,
+    Tray,
+    TrayGraph,
     ElevateStart,
     Lifetime,
     RecEnabled,
@@ -78,6 +80,8 @@ fn current(id: Id, s: &Settings) -> usize {
 fn is_on(id: Id, s: &Settings) -> bool {
     match id {
         Id::ElevateStart => s.elevate_on_start,
+        Id::Tray => s.tray,
+        Id::TrayGraph => s.tray_graph,
         Id::Lifetime => s.highlight_lifetime,
         Id::RecEnabled => s.rec_enabled,
         Id::RecDetail => s.rec_detail,
@@ -229,6 +233,7 @@ fn paint_dropdown(c: &mut Canvas, b: Rect, label: &str, hover: bool, open: bool)
 }
 
 /// A card with a switch.
+#[allow(clippy::too_many_arguments)]
 fn toggle_row(c: &mut Canvas, hits: &mut Vec<(Id, Rect)>, card: Rect, title: &str, note: Option<&str>, id: Id, s: &Settings, hover: Option<Id>) {
     let r = row_card(c, card, title, note, c.px(110));
     hits.push((id, r));
@@ -282,6 +287,15 @@ impl Page for SettingsPage {
         y += card.h + gap;
         let card = rect(area.x + pad, y, card_w, row_h);
         drop_row(c, &mut hits, card, s.update_speed, None, Id::Speed, settings, self);
+        y += card.h + gap;
+        let card = rect(area.x + pad, y, card_w, row_h);
+        toggle_row(c, &mut hits, card, s.tray, Some(s.tray_note), Id::Tray, settings, hover);
+        // The graph in the icon is offered only while there is an icon.
+        if settings.tray {
+            y += card.h + gap;
+            let card = rect(area.x + pad, y, card_w, row_h);
+            toggle_row(c, &mut hits, card, s.tray_graph, None, Id::TrayGraph, settings, hover);
+        }
         y += card.h + section_gap;
 
         // Administrator: how it runs now, then how it starts.
@@ -513,6 +527,8 @@ impl Page for SettingsPage {
                             let on = !is_on(id, cx.settings);
                             match id {
                                 Id::ElevateStart => cx.settings.elevate_on_start = on,
+                                Id::Tray => cx.settings.tray = on,
+                                Id::TrayGraph => cx.settings.tray_graph = on,
                                 Id::Lifetime => cx.settings.highlight_lifetime = on,
                                 Id::RecEnabled => cx.settings.rec_enabled = on,
                                 Id::RecDetail => cx.settings.rec_detail = on,
@@ -521,6 +537,9 @@ impl Page for SettingsPage {
                             }
                             if matches!(id, Id::RecEnabled | Id::RecDetail | Id::RecGpu) {
                                 cx.settings.save_recording();
+                            }
+                            if matches!(id, Id::Tray | Id::TrayGraph) {
+                                cx.cmds.push(Cmd::Tray);
                             }
                         }
                     }

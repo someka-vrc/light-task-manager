@@ -58,6 +58,11 @@ pub struct Settings {
     pub copy_scope: Scope,
     /// Start again as administrator when not already elevated.
     pub elevate_on_start: bool,
+    /// Keep an icon in the notification area; the close button then hides the window there.
+    pub tray: bool,
+    /// The icon in the notification area is a bar graph of the CPU, memory and GPU. Kept
+    /// while `tray` is off, so that turning it back on brings the same icon.
+    pub tray_graph: bool,
     /// The graph over the process table is on, and keeps recording.
     pub tm_enabled: bool,
     /// Ask before turning the graph off (which discards what it recorded).
@@ -115,6 +120,8 @@ impl Default for Settings {
             copy_format: Format::Standard,
             copy_scope: Scope::Visible,
             elevate_on_start: false,
+            tray: false,
+            tray_graph: false,
             tm_enabled: true,
             tm_confirm_off: true,
             tm_minutes: 1,
@@ -189,6 +196,8 @@ impl Settings {
                 "copy_format" => s.copy_format = Format::from_key(value).unwrap_or_default(),
                 "copy_scope" => s.copy_scope = Scope::from_key(value).unwrap_or_default(),
                 "elevate_on_start" => s.elevate_on_start = value == "1",
+                "tray" => s.tray = value == "1",
+                "tray_graph" => s.tray_graph = value == "1",
                 "tm_enabled" => s.tm_enabled = value == "1",
                 "tm_confirm_off" => s.tm_confirm_off = value == "1",
                 "tm_minutes" => s.tm_minutes = value.parse::<u32>().unwrap_or(1).max(1),
@@ -280,7 +289,7 @@ impl Settings {
             .collect();
         let range_items: Vec<String> = self.range_items.iter().map(|(i, w)| format!("{}:{}", i.key(), w)).collect();
         let text = format!(
-            "columns={}\nsort={}\ndescending={}\nview={}\nhighlight_lifetime={}\ninterval={}\nsidebar={}\nwidth={}\nheight={}\nmaximized={}\ncopy_format={}\ncopy_scope={}\nelevate_on_start={}\ntm_enabled={}\ntm_confirm_off={}\ntm_minutes={}\ntm_targets={}\ntm_graph_h={}\nrange_items={}\nrange_ops={}\nrange_sort={}\nrange_desc={}\ntm_export_kind={}\ntm_export_format={}\ntm_export_encoding={}\nlanguage={}\nrec_enabled={}\nrec_seconds={}\nrec_days={}\nrec_detail={}\nrec_gpu={}\nrec_dir={}\n",
+            "columns={}\nsort={}\ndescending={}\nview={}\nhighlight_lifetime={}\ninterval={}\nsidebar={}\nwidth={}\nheight={}\nmaximized={}\ncopy_format={}\ncopy_scope={}\nelevate_on_start={}\ntray={}\ntray_graph={}\ntm_enabled={}\ntm_confirm_off={}\ntm_minutes={}\ntm_targets={}\ntm_graph_h={}\nrange_items={}\nrange_ops={}\nrange_sort={}\nrange_desc={}\ntm_export_kind={}\ntm_export_format={}\ntm_export_encoding={}\nlanguage={}\nrec_enabled={}\nrec_seconds={}\nrec_days={}\nrec_detail={}\nrec_gpu={}\nrec_dir={}\n",
             cols.join(","),
             columns::def(self.sort).key,
             self.descending as u8,
@@ -294,6 +303,8 @@ impl Settings {
             self.copy_format.key(),
             self.copy_scope.key(),
             self.elevate_on_start as u8,
+            self.tray as u8,
+            self.tray_graph as u8,
             self.tm_enabled as u8,
             self.tm_confirm_off as u8,
             self.tm_minutes,
@@ -362,11 +373,7 @@ mod tests {
         std::env::set_var("APPDATA", &dir);
 
         // A change is on disk at once, though settings.ini is not saved yet.
-        let mut s = Settings::default();
-        s.rec_enabled = true;
-        s.rec_seconds = 30;
-        s.rec_days = 7;
-        s.rec_dir = "D:/history".into();
+        let s = Settings { rec_enabled: true, rec_seconds: 30, rec_days: 7, rec_dir: "D:/history".into(), ..Default::default() };
         s.save_recording();
         assert!(pending_file().unwrap().exists());
         assert!(!file().unwrap().exists());

@@ -73,7 +73,7 @@ The UI is available in English, Japanese, Simplified Chinese and Korean. Choose 
 | **Startup apps** | Entries of the Run keys and the Startup folders. Enable or disable them. |
 | **Users** | Signed-in sessions with their resource use, and the processes of the selected user. Disconnect or sign out. |
 | **Services** | The list of services; start, stop or restart them. |
-| **Settings** | Language, update speed, running as administrator, copy format, and highlighting of process start and end. |
+| **Settings** | Language, update speed, staying in the notification area, running as administrator, copy format, and highlighting of process start and end. |
 
 ## Details
 
@@ -175,7 +175,8 @@ Turn it on under "Recording to a database" in Settings (off by default). While o
   ```
 
   Use `to_timestamp` rather than `epoch_ms` in DuckDB, which shows UTC without a time zone. To read several days, attach each file. Keep queries short: a transaction that stays open keeps the `-wal` file from shrinking.
-- **One copy:** only one copy of the app runs at a time. Starting it again brings the running window forward.
+- **One copy:** only one copy of the app runs at a time. Starting it again brings the running window forward, also from the notification area.
+- **Notification area:** with "Stay in the notification area" on in Settings (off by default), the close button hides the window to the notification area and the app keeps running (the graph and the recording go on). Click the icon to show the window; right-click it for Show and Exit. The tooltip shows the CPU and memory use. With "Show a graph in the notification area icon" on, the icon is a bar graph of the CPU (red), memory (yellow) and GPU (blue).
 
 ### Where settings are saved
 
@@ -209,15 +210,17 @@ cargo test
 
 | Path | Role |
 | --- | --- |
-| `src/main.rs` | Entry point (normal start, or the development `--bench` / `--shot`) |
+| `src/main.rs` | Entry point (normal start, or the development `--bench` / `--shot` / `--tray-icons`) |
 | `src/settings.rs` | Loading and saving settings |
-| `src/devtools.rs` | Development benchmark and headless screenshots |
+| `src/devtools.rs` | Development benchmark, headless screenshots and the notification area icons as a picture |
 | **`src/app/`** | **The app's frame** |
 | `src/app/window.rs` | Handling Win32 messages |
 | `src/app/core.rs` | Title bar, sidebar and switching pages |
 | `src/app/aim.rs` | Aiming mode (a transparent window over the whole screen takes the click and finds the process of the window under it) |
 | `src/app/pointer.rs` | Touch and pen gestures |
-| `src/app/instance.rs` | Allowing one running copy (a named mutex; the copy started by "restart as administrator" waits for the old one) |
+| `src/app/instance.rs` | Allowing one running copy (a named mutex; the copy started by "restart as administrator" waits for the old one; a second start asks the running copy to show itself) |
+| `src/app/tray.rs` | The notification area icon. `Tray::sync` is the only place that adds, changes or removes it, from the settings |
+| `src/app/icon.rs` | The app's icons, painted pixel by pixel (the window's icon and the bar graph) |
 | **`src/i18n/`** | **Languages of the UI** |
 | `src/i18n/mod.rs` | The languages, the current language (`tr()`), and fonts per language |
 | `src/i18n/strings.rs` | The text of the UI, grouped by page |
@@ -300,6 +303,7 @@ A number after the page takes that many more samples before writing (for checkin
 `size=width,height` sets the window size (default 1240,760). `tm_gpu` records GPUs in the graph (or name the items directly with `tm=cpu,disk,...`), and `tm_off` turns the graph off. `from_start` hands the pages every sample from the first one (for checking right after starting). `verbose` prints the content of each sample. `minimized` takes the samples as if minimized, and `restore` also takes the sample right after restoring. It prints the number of samples received, the content of the last sample and the needs being read.
 `click=x,y`, `rclick=x,y`, `drag=x1,y1,x2,y2`, `move=x,y`, `zoom=x,y,notches` (`Ctrl` + wheel), `wheel=x,y,dx,dy`, `key=virtual key code`, `type=text` and `filter=search text` replay that input before writing.
 `--shot` uses the default columns, so the column settings are not applied.
+`--tray-icons out.bmp` writes the notification area icons (16, 20, 24 and 32 px, the plain icon and the bar graph at a few levels) on a dark and a light taskbar, at their real size and enlarged.
 
 ### Releasing
 

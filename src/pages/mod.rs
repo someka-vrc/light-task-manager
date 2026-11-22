@@ -44,6 +44,8 @@ pub enum Cmd {
     OpenRecDir,
     /// `Settings::language` changed: switch to it, with its fonts.
     Language,
+    /// `Settings::tray` or `Settings::tray_graph` changed: bring the notification area icon in line.
+    Tray,
     /// Switch to the details page filtered to this PID.
     ShowProcess(u32),
     /// Start aim mode: the next click on any window picks its process.

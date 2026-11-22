@@ -80,6 +80,8 @@ pub static STRINGS: Strings = Strings {
         exported: |path| format!("Exported: {path}"),
         export_failed: |err| format!("Could not export: {err}"),
         filter_cue: "Filter by name, PID, user name or description",
+        tray_show: "Show",
+        tray_exit: "Exit",
     },
     details: Details {
         title: "Processes",
@@ -409,6 +411,9 @@ pub static STRINGS: Strings = Strings {
         copy_format: "Copy format",
         copy_scope: "Properties to copy",
         elevate_on_start: "Start as administrator",
+        tray: "Stay in the notification area",
+        tray_note: "The close button hides the window to the notification area.",
+        tray_graph: "Show a graph in the notification area icon",
         lifetime: "Process start and end",
         lifetime_note: "Highlights processes that just started or ended for a while",
         privileges: "Current status",

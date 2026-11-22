@@ -13,6 +13,7 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("--bench") => devtools::bench(args.get(1).map_or("bench.txt", String::as_str)),
         Some("--shot") => devtools::shot(&args[1..]),
+        Some("--tray-icons") => devtools::tray_icons(args.get(1).map_or("tray-icons.bmp", String::as_str)),
         _ => app::run(),
     }
 }

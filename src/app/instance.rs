@@ -14,6 +14,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 pub const AFTER_ELEVATE: &str = "--after-elevate";
 /// The window class of the main window.
 pub const WINDOW_CLASS: &str = "LightTaskManagerWindow";
+/// The message a second start sends the running copy's window: show yourself, even from the
+/// notification area. The window lets it in from a copy with fewer rights.
+const SHOW_MESSAGE: &str = "LightTaskManager.Show";
 
 const MUTEX_NAME: &str = "Local\\LightTaskManager.SingleInstance";
 /// How long a copy that replaces another waits for it to end.
@@ -72,6 +75,14 @@ pub fn acquire() -> Option<Guard> {
     None
 }
 
+/// The id of `SHOW_MESSAGE`, the same in every process.
+pub fn show_message() -> u32 {
+    static ID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *ID.get_or_init(|| unsafe { RegisterWindowMessageW(wide(SHOW_MESSAGE).as_ptr()) })
+}
+
+/// Asks the running copy to show its window. The window may be hidden in the notification
+/// area, where only the copy itself can bring it back.
 fn bring_forward() {
     let class = wide(WINDOW_CLASS);
     unsafe {
@@ -79,9 +90,10 @@ fn bring_forward() {
         if hwnd.is_null() {
             return;
         }
-        if IsIconic(hwnd) != 0 {
-            ShowWindow(hwnd, SW_RESTORE);
-        }
-        SetForegroundWindow(hwnd);
+        // This copy was just started by the user and may come to the front; it hands that on.
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        AllowSetForegroundWindow(pid);
+        PostMessageW(hwnd, show_message(), 0, 0);
     }
 }

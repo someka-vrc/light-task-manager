@@ -80,6 +80,8 @@ pub static STRINGS: Strings = Strings {
         exported: |path| format!("已导出：{path}"),
         export_failed: |err| format!("无法导出：{err}"),
         filter_cue: "按名称、PID、用户名或描述筛选",
+        tray_show: "显示",
+        tray_exit: "退出",
     },
     details: Details {
         title: "进程",
@@ -409,6 +411,9 @@ pub static STRINGS: Strings = Strings {
         copy_format: "复制格式",
         copy_scope: "要复制的属性",
         elevate_on_start: "启动时以管理员身份运行",
+        tray: "常驻通知区域",
+        tray_note: "点击关闭按钮时隐藏到通知区域。",
+        tray_graph: "在通知区域图标中显示图表",
         lifetime: "进程的创建和结束",
         lifetime_note: "将刚创建或已结束的进程突出显示一段时间",
         privileges: "当前状态",

@@ -2,6 +2,7 @@
 
 use crate::app::core::{Caption, Core};
 use crate::app::pointer::{Contact, Gesture, Out, HOLD_MS};
+use crate::app::tray::{self, Tray, Want, WM_APP_TRAY};
 use crate::i18n::tr;
 use crate::pages::{Cmd, Cursor, Ev};
 use crate::settings::Settings;
@@ -49,6 +50,18 @@ struct App {
     capturing: bool,
     gesture: Gesture,
     started: Instant,
+    /// The icon in the notification area.
+    tray: Tray,
+    /// The window is hidden in the notification area.
+    hidden: bool,
+    /// The app is ending: the next WM_CLOSE closes rather than hides.
+    quitting: bool,
+}
+
+/// The message Explorer sends when the taskbar comes (back): the icons have to be added again.
+fn taskbar_created() -> u32 {
+    static ID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *ID.get_or_init(|| unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) })
 }
 
 /// Asks Windows for dark native menus. These entry points are unnamed, so a
@@ -85,55 +98,6 @@ fn create_edit_font(px: i32) -> HFONT {
     }
 }
 
-fn app_icon(size: i32) -> HICON {
-    let accent = THEME.accent;
-    let on = 0x0B1730u32;
-    let f = size as f32;
-    let radius = f * 0.24;
-    let points = [(0.16, 0.56), (0.36, 0.56), (0.46, 0.28), (0.58, 0.74), (0.68, 0.48), (0.84, 0.48)];
-    let mut px = vec![0u32; (size * size) as usize];
-    for y in 0..size {
-        for x in 0..size {
-            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
-            let qx = (fx - f / 2.0).abs() - f / 2.0 + radius;
-            let qy = (fy - f / 2.0).abs() - f / 2.0 + radius;
-            let d = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() + qx.max(qy).min(0.0) - radius;
-            let tile = (0.5 - d).clamp(0.0, 1.0);
-            let mut line_d = f32::MAX;
-            for w in points.windows(2) {
-                let (ax, ay, bx, by) = (w[0].0 * f, w[0].1 * f, w[1].0 * f, w[1].1 * f);
-                let (dx, dy) = (bx - ax, by - ay);
-                let t = (((fx - ax) * dx + (fy - ay) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
-                line_d = line_d.min(((fx - ax - t * dx).powi(2) + (fy - ay - t * dy).powi(2)).sqrt());
-            }
-            let line = (f * 0.05 + 0.5 - line_d).clamp(0.0, 1.0);
-            let mix = |shift: u32| {
-                let (a, b) = (((accent >> shift) & 255) as f32, ((on >> shift) & 255) as f32);
-                ((a + (b - a) * line) * tile) as u32
-            };
-            px[(y * size + x) as usize] =
-                (((tile * 255.0) as u32) << 24) | (mix(16) << 16) | (mix(8) << 8) | mix(0);
-        }
-    }
-    unsafe {
-        let mut bmi: BITMAPINFO = std::mem::zeroed();
-        bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-        bmi.bmiHeader.biWidth = size;
-        bmi.bmiHeader.biHeight = -size;
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        let mut bits = null_mut();
-        let color = CreateDIBSection(null_mut(), &bmi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
-        std::ptr::copy_nonoverlapping(px.as_ptr(), bits as *mut u32, px.len());
-        let mask = CreateBitmap(size, size, 1, 1, null());
-        let info = ICONINFO { fIcon: 1, xHotspot: 0, yHotspot: 0, hbmMask: mask, hbmColor: color };
-        let icon = CreateIconIndirect(&info);
-        DeleteObject(color);
-        DeleteObject(mask);
-        icon
-    }
-}
-
 pub fn run() {
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -160,7 +124,7 @@ pub fn run() {
     unsafe {
         let hinstance = GetModuleHandleW(null());
         let class = wide(crate::app::instance::WINDOW_CLASS);
-        let big = app_icon(48);
+        let big = crate::app::icon::app_icon(48);
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             style: CS_DBLCLKS,
@@ -173,7 +137,7 @@ pub fn run() {
             hbrBackground: null_mut(),
             lpszMenuName: null(),
             lpszClassName: class.as_ptr(),
-            hIconSm: app_icon(20),
+            hIconSm: crate::app::icon::app_icon(20),
         };
         RegisterClassExW(&wc);
 
@@ -203,6 +167,7 @@ pub fn run() {
         let maximized = (*app).core.settings.maximized;
         ShowWindow(hwnd, if maximized { SW_SHOWMAXIMIZED } else { SW_SHOWNORMAL });
         UpdateWindow(hwnd);
+        (*app).sync_tray();
 
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
@@ -369,6 +334,11 @@ unsafe fn create(hwnd: HWND, cs: &CREATESTRUCTW) -> Box<App> {
     let caption = colorref(THEME.window);
     DwmSetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR as u32, (&caption as *const u32).cast(), 4);
     SetWindowPos(hwnd, null_mut(), x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+    // Running as administrator, the window would not hear these from Explorer or from a
+    // second start with fewer rights.
+    for msg in [taskbar_created(), crate::app::instance::show_message(), WM_APP_TRAY] {
+        ChangeWindowMessageFilterEx(hwnd, msg, MSGFLT_ALLOW, null_mut());
+    }
 
     Box::new(App {
         hwnd,
@@ -383,6 +353,9 @@ unsafe fn create(hwnd: HWND, cs: &CREATESTRUCTW) -> Box<App> {
         capturing: false,
         gesture: Gesture::new(),
         started: Instant::now(),
+        tray: Tray::new(hwnd),
+        hidden: false,
+        quitting: false,
     })
 }
 
@@ -413,6 +386,49 @@ impl App {
         EDIT_FONT.store(font as isize, Ordering::Relaxed);
         SendMessageW(self.edit, WM_SETFONT, font as usize, 1);
         DeleteObject(previous as HFONT);
+    }
+
+    /// Brings the notification area icon in line with the settings.
+    unsafe fn sync_tray(&mut self) {
+        let want = Want::of(&self.core.settings);
+        self.tray.sync(want);
+        // Without an icon there would be no way back to a hidden window.
+        if want == Want::None && self.hidden {
+            self.reveal();
+        }
+    }
+
+    /// Shows the window, from the notification area or minimized, and brings it to the front.
+    unsafe fn reveal(&mut self) {
+        if self.hidden {
+            self.hidden = false;
+            ShowWindow(self.hwnd, SW_SHOW);
+            // Hidden while minimized, it shows minimized: the restore below takes it from there.
+            if IsIconic(self.hwnd) == 0 && self.core.shared.minimized.swap(false, Ordering::Relaxed) {
+                self.core.shared.poke();
+            }
+            self.core.dirty = true;
+            InvalidateRect(self.hwnd, null(), 0);
+        }
+        if IsIconic(self.hwnd) != 0 {
+            ShowWindow(self.hwnd, SW_RESTORE);
+        }
+        SetForegroundWindow(self.hwnd);
+    }
+
+    /// Hides the window in the notification area. The sampler reads only what is needed while
+    /// minimized, and the settings are saved, since the app may stay there for days.
+    unsafe fn conceal(&mut self) {
+        self.save();
+        self.core.shared.minimized.store(true, Ordering::Relaxed);
+        ShowWindow(self.hwnd, SW_HIDE);
+        self.hidden = true;
+    }
+
+    /// Ends the app, whatever the close button would do.
+    unsafe fn quit(&mut self) {
+        self.quitting = true;
+        PostMessageW(self.hwnd, WM_CLOSE, 0, 0);
     }
 
     unsafe fn after(&mut self, immediate: bool) {
@@ -447,7 +463,10 @@ impl App {
                     SetWindowTextW(self.hwnd, wide(actions::app_title()).as_ptr());
                     InvalidateRect(self.edit, null(), 1);
                     self.core.dirty = true;
+                    // The tooltip is in the language too.
+                    self.sync_tray();
                 }
+                Cmd::Tray => self.sync_tray(),
                 Cmd::PickRecDir => {
                     let current = crate::system::recorder::folder(&self.core.settings.rec_dir);
                     if let Some(dir) = folder_dialog(self.hwnd, tr().settings.record_pick, current.as_deref()) {
@@ -475,7 +494,8 @@ impl App {
                 }
                 Cmd::Elevate => {
                     if actions::relaunch_elevated(true) {
-                        PostMessageW(self.hwnd, WM_CLOSE, 0, 0);
+                        // The new copy waits for this one to end, so this one must not stay in the tray.
+                        self.quit();
                     } else {
                         self.core.toast(tr().app.elevate_cancelled.into());
                     }
@@ -660,7 +680,8 @@ impl App {
         let s = &mut self.core.settings;
         s.width = ((r.right - r.left) as f32 / scale) as i32;
         s.height = ((r.bottom - r.top) as f32 / scale) as i32;
-        s.maximized = IsZoomed(self.hwnd) != 0;
+        // Not IsZoomed: minimized or hidden, the window is not zoomed, but comes back maximized.
+        s.maximized = self.core.maximized;
         s.save();
         for page in &mut self.core.pages {
             page.on_exit();
@@ -768,6 +789,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         return DefWindowProcW(hwnd, msg, wp, lp);
     }
     let app = &mut *ptr;
+    // Registered messages have no fixed number to match on.
+    if msg == taskbar_created() {
+        app.tray.reset();
+        return 0;
+    }
+    if msg == crate::app::instance::show_message() {
+        app.reveal();
+        return 0;
+    }
 
     match msg {
         WM_NCCALCSIZE if wp != 0 => {
@@ -851,7 +881,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 app.core.shared.minimized.store(true, Ordering::Relaxed);
                 return 0;
             }
-            if app.core.shared.minimized.swap(false, Ordering::Relaxed) {
+            // Hidden in the tray, a size change (a display or DPI change) must not make the
+            // sampler read everything again; `reveal` takes care of that.
+            if !app.hidden && app.core.shared.minimized.swap(false, Ordering::Relaxed) {
                 app.core.shared.poke();
             }
             app.core.maximized = wp as u32 == SIZE_MAXIMIZED;
@@ -1012,7 +1044,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let snap = app.core.shared.slot.lock().unwrap().take();
             if let Some(snap) = snap {
                 app.core.on_snapshot(&snap);
+                app.tray.update(tray::levels(&snap));
                 app.after(false);
+            }
+            0
+        }
+        WM_APP_TRAY => {
+            match tray::event(wp, lp) {
+                // A click always shows the window: hiding is the close button's.
+                Some(tray::Event::Select) => app.reveal(),
+                Some(tray::Event::Menu(x, y)) => match app.tray.menu(x, y) {
+                    Some(tray::Command::Show) => app.reveal(),
+                    Some(tray::Command::Exit) => app.quit(),
+                    None => {}
+                },
+                None => {}
             }
             0
         }
@@ -1027,6 +1073,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_CLOSE => {
+            // With an icon to come back by, the close button only hides the window.
+            if !app.quitting && app.core.settings.tray && app.tray.shown() {
+                if !app.hidden {
+                    app.conceal();
+                }
+                return 0;
+            }
+            app.tray.sync(Want::None);
             app.save();
             // The recording's session ends here, before the process does.
             app.core.shared.end_recording(false);
